@@ -7,10 +7,10 @@ This repository is Unncpmas's fork of [Galaxy Android by OpenPort Labs](https://
 
 ## Latest download
 
-- **Android ARM64 APK, version 0.0.32 (version code 37):** [Download GalaxyAndroid-v0.0.32-arm64.apk](https://github.com/Unnpcmas/Galaxy-Android-Public-Source/releases/download/0.0.32/GalaxyAndroid-v0.0.32-arm64.apk)
-- **GitHub Release:** [Galaxy Android v0.0.32](https://github.com/Unnpcmas/Galaxy-Android-Public-Source/releases/tag/0.0.32)
-- **Download the full source code (.zip):** [Galaxy-Android-main.zip](https://github.com/Unnpcmas/Galaxy-Android-Public-Source/archive/refs/heads/main.zip)
-- **Browse project files:** [source tree](https://github.com/Unnpcmas/Galaxy-Android-Public-Source/tree/main)
+- **Android ARM64 APK, version 0.0.32 (version code 37):** [Download GalaxyAndroid-v0.0.32-arm64.apk](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.32/GalaxyAndroid-v0.0.32-arm64.apk)
+- **GitHub Release:** [Galaxy Android v0.0.32](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/tag/0.0.32)
+- **Download the full source code (.zip):** [Galaxy-Android-main.zip](https://github.com/Unnpcmas/GalaxyAndroidFork/archive/refs/heads/main.zip)
+- **Browse project files:** [source tree](https://github.com/Unnpcmas/GalaxyAndroidFork/tree/main)
 - **Build date, notes, and SHA-256 checks:** [LATEST_UPDATE.md](LATEST_UPDATE.md)
 
 Only the latest APK is included. This build targets `arm64-v8a`; it does not include 32-bit support.

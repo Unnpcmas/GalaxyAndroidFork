@@ -50,7 +50,7 @@ With the unified **GalaxyAndroid** package, your phone extracts, decrypts, and c
    - **`.wia`** / **`.ciso`** / **`.zip`**
 
 ### Step 2: Install the Unified APK
-Download the current ARM64 build, [GalaxyAndroid-v0.0.32-arm64.apk](https://github.com/Unnpcmas/Galaxy-Android-Public-Source/releases/download/0.0.32/GalaxyAndroid-v0.0.32-arm64.apk), from this fork's [GitHub Releases](https://github.com/Unnpcmas/Galaxy-Android-Public-Source/releases), then install it.
+Download the current ARM64 build, [GalaxyAndroid-v0.0.32-arm64.apk](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.32/GalaxyAndroid-v0.0.32-arm64.apk), from this fork's [GitHub Releases](https://github.com/Unnpcmas/GalaxyAndroidFork/releases), then install it.
 
 ### Step 3: Launch & Setup
 1. Launch **Galaxy Android** from your app drawer.

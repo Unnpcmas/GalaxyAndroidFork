@@ -31,7 +31,7 @@ El APK unificado puede extraer y convertir localmente la imagen de disco; no hac
 
 1. Copia la imagen del disco a la carpeta `Download` del teléfono.
 2. Formatos admitidos por el preparador: `.rvz`, `.wbfs`, `.iso`, `.wia`, `.ciso` y `.zip`.
-3. Instala el [APK ARM64 v0.0.32](https://github.com/Unnpcmas/Galaxy-Android-Public-Source/releases/download/0.0.32/GalaxyAndroid-v0.0.32-arm64.apk).
+3. Instala el [APK ARM64 v0.0.32](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.32/GalaxyAndroid-v0.0.32-arm64.apk).
 4. Abre Galaxy Android y concede el acceso a archivos que solicite para leer la imagen y guardar los datos en `/sdcard/GalaxyData`.
 5. En la pantalla de preparación, elige la imagen. Activa la opción de incluir cinemáticas solo si quieres esos archivos.
 6. Inicia la preparación y espera a que termine antes de cerrar la aplicación.
