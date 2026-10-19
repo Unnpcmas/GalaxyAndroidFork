@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Galaxy Android</string>
+    <string name="header_title">Galaxy Android</string>
+    <string name="header_subtitle">Port Android independiente · ARM64</string>
+    <string name="section_source">Archivos del juego</string>
+    <string name="btn_select_disc">Seleccionar archivo de juego</string>
+    <string name="btn_auto_detect">Buscar en Descargas</string>
+    <string name="no_source_selected">Ningún archivo seleccionado</string>
+    <string name="section_options">Opciones de conversión</string>
+    <string name="include_movies">Incluir vídeos de escenas (+2,3 GB)</string>
+    <string name="section_cook">Instalación</string>
+    <string name="btn_start_cook">Iniciar instalación</string>
+    <string name="btn_launch_game">Iniciar juego</string>
+    <string name="status_ready">Listo</string>
+    <string name="status_cooking">Preparando archivos del juego… Mantén la aplicación abierta.</string>
+    <string name="status_done">Archivos listos. Iniciando el juego…</string>
+    <string name="status_error">Ocurrió un error durante la instalación.</string>
+    <string name="title_gpu_driver">Controlador gráfico</string>
+    <string name="btn_install_driver">Instalar controlador (.zip)</string>
+    <string name="btn_reset_driver">Volver al controlador del sistema</string>
+    <string name="driver_system_default">Controlador incluido por el sistema</string>
+    <string name="driver_help_text">Los controladores Turnip/Adreno son compatibles con algunos procesadores Snapdragon. En Mali/MediaTek se utiliza el controlador del sistema.</string>
+    <string name="quality_saved_format">Calidad guardada: %1$s</string>
+</resources>

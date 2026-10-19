@@ -1,0 +1,31 @@
+name: Attach latest APK to release / Adjuntar APK más reciente
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  attach-apk:
+    name: Attach the current ARM64 APK / Adjuntar el APK ARM64 actual
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out the current source / Descargar el código actual
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Attach APK to the matching release / Adjuntar APK a su release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/.*android:versionName="\([^"]*\)".*/\1/p' platform/mobile/AndroidManifest.xml)"
+          test -n "$version" || { echo "Could not read Android versionName"; exit 1; }
+          tag="$version"
+          apk="downloads/GalaxyAndroid-v${version}-arm64.apk"
+          test -s "$apk" || { echo "APK not found: $apk"; exit 1; }
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh release upload "$tag" "$apk" --clobber --repo "$GITHUB_REPOSITORY"
