@@ -16,7 +16,7 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
 
-      - name: Attach APK to the matching release / Adjuntar APK a su release
+      - name: Attach APK and source to the matching release / Adjuntar APK y código fuente
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -27,5 +27,14 @@ jobs:
           tag="$version"
           apk="downloads/GalaxyAndroid-v${version}-arm64.apk"
           test -s "$apk" || { echo "APK not found: $apk"; exit 1; }
+          source_root="Galaxy-Android-Source-${version}"
+          source_zip="$RUNNER_TEMP/${source_root}.zip"
+          source_stage="$RUNNER_TEMP/source"
+          git fetch --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
+          mkdir -p "$source_stage"
+          git archive --format=tar --prefix="${source_root}/" "$tag" \
+            | tar --exclude="${source_root}/downloads" -xf - -C "$source_stage"
+          (cd "$source_stage" && zip -qr "$source_zip" "$source_root")
+          test -s "$source_zip" || { echo "Source archive not created"; exit 1; }
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null
-          gh release upload "$tag" "$apk" --clobber --repo "$GITHUB_REPOSITORY"
+          gh release upload "$tag" "$apk" "$source_zip" --clobber --repo "$GITHUB_REPOSITORY"
