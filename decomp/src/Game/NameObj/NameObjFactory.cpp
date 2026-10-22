@@ -16,6 +16,7 @@
 #include "Game/Screen.hpp"
 #include "Game/Util/FileUtil.hpp"
 #include "Game/Util/StringUtil.hpp"
+#include "port/port.h"
 
 namespace {
     template < typename T >
@@ -8097,10 +8098,34 @@ namespace {
         "Hopper",          "BenefitItemInvincible", "MorphItemNeoBee", "MorphItemNeoFire",
         "MorphItemNeoFoo", "MorphItemNeoHopper",    "MorphItemNeoIce", "MorphItemNeoTeresa",
     };
+
+    // Randomizer: the name of the object that is really created and whose archives are mounted
+    // for a placed object. The replacement is used only when the factory knows it, so a wrong
+    // entry can never leave an object without a creator.
+    const char* randomizedObjectName(const char* pName) {
+        if (pName == nullptr) {
+            return pName;
+        }
+
+        const char* pMapped = port_rando_object(pName);
+        if (pMapped == nullptr || pMapped == pName) {
+            return pName;
+        }
+
+        for (const NameObjFactory::Name2CreateFunc* pEntry = ::cCreateTable; pEntry != ::cCreateTable + ARRAY_SIZE(::cCreateTable); pEntry++) {
+            if (pEntry->mName != nullptr && MR::isEqualStringCase(pEntry->mName, pMapped)) {
+                return pMapped;
+            }
+        }
+
+        return pName;
+    }
 };  // namespace
 
 namespace NameObjFactory {
     CreatorFuncPtr getCreator(const char* pName) {
+        pName = ::randomizedObjectName(pName);
+
         if (PlanetMapCreatorFunction::isRegisteredObj(pName)) {
             return PlanetMapCreatorFunction::getPlanetMapCreator(pName);
         }
@@ -8115,6 +8140,7 @@ namespace NameObjFactory {
     }
 
     void requestMountObjectArchives(const char* pName, const JMapInfoIter& rIter) {
+        pName = ::randomizedObjectName(pName);
         NameObjArchiveListCollector collector;
         getMountObjectArchiveList(&collector, pName, rIter);
 
@@ -8124,6 +8150,7 @@ namespace NameObjFactory {
     }
 
     bool isReadResourceFromDVD(const char* pName, const JMapInfoIter& rIter) {
+        pName = ::randomizedObjectName(pName);
         NameObjArchiveListCollector collector;
         getMountObjectArchiveList(&collector, pName, rIter);
 

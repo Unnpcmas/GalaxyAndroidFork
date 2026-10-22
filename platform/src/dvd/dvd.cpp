@@ -25,6 +25,7 @@
 #include "revolution/dvd.h"
 #include "revolution/os.h"
 #include "revolution/sc.h"
+#include "dvd/mod_manager.h"
 
 enum {
     kStateEnd = 0,
@@ -152,6 +153,8 @@ extern "C" const PortDisc* port_dvd_disc(void) { return sDisc; }
 extern "C" void port_dvd_set_root(const char* root) {
     PortHostAllocScope scope;
     sDataRoot = root;
+    port_mods::setGameRoot(sDataRoot);
+    port_mods::setGlobalEnabled(port_is_riivolution_mods() != 0);
     sDisc = port_dvd_identify(root);
     sLanguageCount = 0;
     if (sDisc) {
@@ -248,6 +251,7 @@ static bool loadFst() {
     sFst.resize(count);
     // Directory path of each directory entry, built as we walk.
     std::vector<std::string> dirPath(count);
+    u32 replacedFiles = 0;
     dirPath[0] = "";
     std::vector<u32> stack;  // (dir index) while walking
     stack.push_back(0);
@@ -292,9 +296,15 @@ static bool loadFst() {
             stack.push_back(i);
         } else {
             fe.hostPath = sDataRoot + "/files/" + full;
+            const std::string replacement = port_mods::findReplacement(full);
+            if (!replacement.empty()) {
+                fe.hostPath = replacement;
+                ++replacedFiles;
+            }
         }
     }
-    port_log("dvd: fst loaded, %u entries, root %s", count, sDataRoot.c_str());
+    port_log("dvd: fst loaded, %u entries, root %s, mod replacements %u",
+             count, sDataRoot.c_str(), replacedFiles);
     return true;
 }
 
@@ -448,6 +458,7 @@ static void dvdIrq() {
 static void submit(DVDCommandBlock* b, u32 entry) {
     b->state = kStateBusy;
     b->transferredSize = 0;
+    PortHostAllocScope hostAlloc;  // sPending outlives scene changes: keep its storage out of the game heap
     std::lock_guard<std::mutex> lk(sQueueMutex);
     sPending.push_back({b, entry});
     sQueueCv.notify_one();

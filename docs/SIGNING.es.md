@@ -38,6 +38,6 @@ Añade los valores solo mediante la configuración protegida de secretos de GitH
 Con Android SDK Build Tools instaladas:
 
 ```bash
-apksigner verify --print-certs downloads/GalaxyAndroid-v0.0.32-arm64.apk
-adb install -r downloads/GalaxyAndroid-v0.0.32-arm64.apk
+apksigner verify --print-certs downloads/GalaxyAndroid-v0.0.38-arm64.apk
+adb install -r downloads/GalaxyAndroid-v0.0.38-arm64.apk
 ```

@@ -6,6 +6,7 @@
 #include <android/keycodes.h>
 #include <android/log.h>
 #include <math.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,7 @@
 
 #include "port/port.h"
 #include "port/input.h"
+#include "dvd/mod_manager.h"
 #include "xr/ui_font.h"
 
 #define LOGI(...) port_log("INFO MobileUI: " __VA_ARGS__)
@@ -32,9 +34,13 @@
 
 namespace mobile_ui {
 
+static constexpr float kAntialiasingRowHeight = 64.0f;
+
 extern "C" void port_android_exit_to_launcher();
 extern "C" int port_android_copy_to_clipboard(const char* bytes, int length);
 extern "C" void port_set_game_speed(float speed);
+extern "C" void port_skip_set_hold_seconds(float seconds);
+extern "C" void port_skip_indicator(float* progress, int* forwarding, unsigned* skips);
 extern "C" float port_get_game_speed(void);
 extern "C" void port_language_set(const char* name);
 extern "C" void port_set_display_refresh_rate(int hz);
@@ -44,6 +50,13 @@ inline void applyTargetFps(int fps) {
     if (fps < 30) fps = 30;
     if (fps > 144) fps = 144;
     port_set_display_refresh_rate(fps);
+}
+
+// "Saltar cinemáticas": movies are skipped outright (port_is_skip_cutscenes),
+// and holding A for one second skips in-engine cutscenes and dialogue
+// (cutscene_skip.cpp). 0 turns the hold-to-skip engine off.
+inline void applySkipCutscenes(bool on) {
+    port_skip_set_hold_seconds(on ? 1.0f : 0.0f);
 }
 
 inline void applyGameSpeed(int speedIdx) {
@@ -101,6 +114,19 @@ float settingsDrawerWidth(float screenW, float screenH, float uiScale) {
     // limit on phones and portrait layouts.
     const float widthFraction = screenW >= screenH ? 0.48f : 0.88f;
     return std::min(screenW * widthFraction, 620.0f * uiScale);
+}
+
+constexpr float kModsListStartY = 172.0f;
+constexpr float kModsRowPitch = 72.0f;
+constexpr float kModsRowHeight = 66.0f;
+
+float modsExtrasStartY() {
+    const size_t count = port_mods::list()->size();
+    return count == 0 ? 282.0f : kModsListStartY + count * kModsRowPitch + 12.0f;
+}
+
+float modsTabContentHeight() {
+    return modsExtrasStartY() + 1500.0f;  // footnote + bottom margin so the last rows clear the Done bar
 }
 
 std::string controllerKeyName(int keyCode) {
@@ -384,6 +410,36 @@ void Settings::load(const std::string& path) {
             else if (!strcmp(key, "mod_classic_gamepad_ui")) modClassicGamepadUI = (val > 0.5f);
             else if (!strcmp(key, "mod_riivolution")) modRiivolution = (val > 0.5f);
             else if (!strcmp(key, "mod_fly")) modFly = (val > 0.5f);
+            else if (!strcmp(key, "mod_luigi")) modLuigi = (val > 0.5f);
+            else if (!strcmp(key, "show_cam_stick")) showCamStick = (val > 0.5f);
+            else if (!strcmp(key, "cam_stick_scale")) camStickScale = std::max(0.6f, std::min(1.6f, val));
+            else if (!strcmp(key, "cam_stick_opacity")) camStickOpacity = std::max(0.1f, std::min(1.0f, val));
+            else if (!strcmp(key, "cam_stick_sensitivity")) camStickSensitivity = std::max(0.5f, std::min(2.0f, val));
+            else if (!strcmp(key, "cam_stick_offset_x")) camStickOffsetX = val;
+            else if (!strcmp(key, "cam_stick_offset_y")) camStickOffsetY = val;
+            else if (!strcmp(key, "show_cam_reset")) showCamReset = (val > 0.5f);
+            else if (!strcmp(key, "cam_reset_scale")) camResetScale = std::max(0.6f, std::min(1.6f, val));
+            else if (!strcmp(key, "cam_reset_opacity")) camResetOpacity = std::max(0.1f, std::min(1.0f, val));
+            else if (!strcmp(key, "cam_reset_offset_x")) camResetOffsetX = val;
+            else if (!strcmp(key, "cam_reset_offset_y")) camResetOffsetY = val;
+            else if (!strcmp(key, "gyro_camera")) gyroCamera = (val > 0.5f);
+            else if (!strcmp(key, "gyro_camera_sens")) gyroCameraSens = std::max(0.3f, std::min(2.5f, val));
+            else if (!strcmp(key, "adaptive_quality")) adaptiveQuality = (val > 0.5f);
+            else if (!strcmp(key, "log_enabled")) logEnabled = (val > 0.5f);
+            else if (!strcmp(key, "diff_enemy_damage")) diffEnemyDamage = std::max(1, std::min(4, (int)val));
+            else if (!strcmp(key, "diff_boss_damage")) diffBossDamage = std::max(1, std::min(4, (int)val));
+            else if (!strcmp(key, "diff_one_hit")) diffOneHit = (val > 0.5f);
+            else if (!strcmp(key, "diff_no_heal")) diffNoHeal = (val > 0.5f);
+            else if (!strcmp(key, "diff_max_health_3")) diffMaxHealth3 = (val > 0.5f);
+            else if (!strcmp(key, "rando_enabled")) randoEnabled = (val > 0.5f);
+            else if (!strcmp(key, "rando_seed")) randoSeed = std::max(0, std::min(999999, (int)val));
+            else if (!strcmp(key, "rando_galaxies")) randoGalaxies = (val > 0.5f);
+            else if (!strcmp(key, "rando_stars")) randoStars = (val > 0.5f);
+            else if (!strcmp(key, "rando_enemies")) randoEnemies = (val > 0.5f);
+            else if (!strcmp(key, "rando_items")) randoItems = (val > 0.5f);
+            else if (!strcmp(key, "rando_powerups")) randoPowerUps = (val > 0.5f);
+            else if (!strcmp(key, "rando_challenge")) randoChallenge = (val > 0.5f);
+            else if (!strcmp(key, "fov_offset")) fovOffset = std::max(-20, std::min(40, (int)val));
             else if (!strcmp(key, "mod_skip_cutscenes")) modSkipCutscenes = (val > 0.5f);
             else if (!strcmp(key, "mod_infinite_health")) modInfiniteHealth = (val > 0.5f);
             else if (!strcmp(key, "mod_infinite_lives")) modInfiniteLives = (val > 0.5f);
@@ -391,13 +447,13 @@ void Settings::load(const std::string& path) {
             else if (!strcmp(key, "game_speed")) gameSpeed = std::max(1, std::min(5, (int)val));
             else if (!strcmp(key, "language_choice")) languageChoice = std::max(0, std::min(5, (int)val));
             else if (!strcmp(key, "render_scale")) renderScale = std::max(0, std::min(4, (int)val));
+            else if (!strcmp(key, "antialiasing_level")) antialiasingLevel = std::max(0, std::min(12, (int)val));
             else if (!strcmp(key, "target_fps")) {
                 int v = (int)val;
-                if (v >= 144) targetFps = 144;
-                else if (v >= 120) targetFps = 120;
-                else if (v >= 90) targetFps = 90;
-                else if (v >= 60) targetFps = 60;
-                else targetFps = 30;
+                // The game runs at a fixed 60 FPS; faster targets only repeated
+                // images, so saved 90/120/144 values load as 60 (30 stays: it is
+                // the Battery Saver rate).
+                targetFps = (v >= 60) ? 60 : 30;
             }
             else if (!strcmp(key, "adaptive_fps")) adaptiveFps = (val > 0.5f);
             else if (!strcmp(key, "battery_saver")) batterySaver = (val > 0.5f);
@@ -439,14 +495,88 @@ void Settings::load(const std::string& path) {
         migratedSettings = true;
         LOGI("Migrated display framing to native full-screen Hor+; game saves preserved");
     }
+    LOGI("Settings detail: touchScale=%.2f touchOpacity=%.2f dpad=%d | leftStickSens=%.2f rightStickSens=%.2f deadzone=%.2f camInv=%d/%d | "
+         "camStick show=%d scale=%.2f opacity=%.2f sens=%.2f offset=%.0f,%.0f | gyroCamera=%d sens=%.2f gyroAiming=%d inv=%d/%d | "
+         "camReset show=%d scale=%.2f opacity=%.2f offset=%.0f,%.0f | adaptiveQuality=%d fovOffset=%d | mods fly=%d luigi=%d skipCutscenes=%d speed=%d freeCam=%d riivolution=%d",
+         scale, opacity, showDpad ? 1 : 0, leftStickSensitivity, rightStickSensitivity,
+         controllerDeadzone, cameraInvertX ? 1 : 0, cameraInvertY ? 1 : 0, showCamStick ? 1 : 0, camStickScale,
+         camStickOpacity, camStickSensitivity, camStickOffsetX, camStickOffsetY, gyroCamera ? 1 : 0, gyroCameraSens,
+         gyroAiming ? 1 : 0, gyroInvertX ? 1 : 0, gyroInvertY ? 1 : 0,
+         showCamReset ? 1 : 0, camResetScale, camResetOpacity, camResetOffsetX, camResetOffsetY, adaptiveQuality ? 1 : 0, fovOffset,
+         modFly ? 1 : 0, modLuigi ? 1 : 0, modSkipCutscenes ? 1 : 0, gameSpeed, modFreeCamera ? 1 : 0,
+         modRiivolution ? 1 : 0);
     if (migratedSettings) save(path);
-    LOGI("Loaded settings: show=%d, full=%d, screenScale=%d, touch=%d, hud=%d, backend=%d, relPtr=%d, orient=%d, saver=%d, gyro=%d, gyroInvX=%d, gyroInvY=%d, camSens=%.2f, camInvX=%d, camInvY=%d, op=%.2f, scale=%.2f, dpad=%d, fly=%d, skip=%d, infHp=%d, infLives=%d, infBits=%d, spd=%d, lang=%d, res=%d, hap=%d",
-          showControls, fullscreen, screenScaleIndex, fullTouchMode, perfHudMode, graphicsBackend, relativePointer ? 1 : 0, screenOrientationChoice, batterySaver ? 1 : 0, gyroAiming ? 1 : 0, gyroInvertX ? 1 : 0, gyroInvertY ? 1 : 0, rightStickSensitivity, cameraInvertX ? 1 : 0, cameraInvertY ? 1 : 0, opacity, scale, showDpad, modFly, modSkipCutscenes, modInfiniteHealth, modInfiniteLives, modInfiniteStarBits, gameSpeed, languageChoice, renderScale, haptics ? 1 : 0);
+    LOGI("Settings difficulty: enemyDamage=x%d bossDamage=x%d oneHit=%d noHeal=%d maxHealth3=%d | log=%s",
+         diffEnemyDamage, diffBossDamage, diffOneHit ? 1 : 0, diffNoHeal ? 1 : 0, diffMaxHealth3 ? 1 : 0,
+         logEnabled ? "on" : "OFF");
+    logMods("loaded at start");
+    LOGI("Settings randomizer: %s seed=%06d galaxies=%d missions=%d enemies=%d items=%d powerups=%d challenge=%d",
+         randoEnabled ? "ON" : "off", randoSeed, randoGalaxies ? 1 : 0, randoStars ? 1 : 0, randoEnemies ? 1 : 0,
+         randoItems ? 1 : 0, randoPowerUps ? 1 : 0, randoChallenge ? 1 : 0);
+    LOGI("Loaded settings: show=%d, full=%d, screenScale=%d, touch=%d, hud=%d, backend=%d, relPtr=%d, orient=%d, saver=%d, gyro=%d, gyroInvX=%d, gyroInvY=%d, camSens=%.2f, camInvX=%d, camInvY=%d, op=%.2f, scale=%.2f, dpad=%d, fly=%d, luigi=%d, skip=%d, infHp=%d, infLives=%d, infBits=%d, spd=%d, lang=%d, res=%d, aa=%d, hap=%d",
+           showControls, fullscreen, screenScaleIndex, fullTouchMode, perfHudMode, graphicsBackend, relativePointer ? 1 : 0, screenOrientationChoice, batterySaver ? 1 : 0, gyroAiming ? 1 : 0, gyroInvertX ? 1 : 0, gyroInvertY ? 1 : 0, rightStickSensitivity, cameraInvertX ? 1 : 0, cameraInvertY ? 1 : 0, opacity, scale, showDpad, modFly, modLuigi ? 1 : 0, modSkipCutscenes, modInfiniteHealth, modInfiniteLives, modInfiniteStarBits, gameSpeed, languageChoice, renderScale, antialiasingLevel, haptics ? 1 : 0);
+}
+
+// key=value lines of a settings file, in file order (for the change log).
+static std::vector<std::pair<std::string, std::string>> readSettingsPairs(const std::string& path) {
+    std::vector<std::pair<std::string, std::string>> out;
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return out;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        std::string v(eq + 1);
+        while (!v.empty() && (v.back() == '\n' || v.back() == '\r')) v.pop_back();
+        out.emplace_back(line, v);
+    }
+    fclose(f);
+    return out;
+}
+
+void Settings::logMods(const char* why) const {
+    auto onoff = [](bool b) { return b ? "ON" : "off"; };
+    LOGI("mods: ======== state (%s) ========", why);
+    LOGI("mods: remaster  | Shield HD textures        = %s (1080p AI textures)", onoff(modShieldTextures));
+    LOGI("mods: remaster  | Shield 60 FPS cutscenes   = %s", onoff(modShieldCutscenes));
+    LOGI("mods: remaster  | Shield controller curves  = %s", onoff(modShieldControls));
+    LOGI("mods: remaster  | ABXY gamepad button sheets= %s", onoff(modClassicGamepadUI));
+    LOGI("mods: remaster  | Riivolution patches      = %s (/sdcard/GalaxyData/mods)", onoff(modRiivolution));
+    LOGI("mods: gameplay  | Fly mode                  = %s", onoff(modFly));
+    LOGI("mods: gameplay  | Play as Luigi             = %s (applies on the next stage load)", onoff(modLuigi));
+    LOGI("mods: gameplay  | Free camera               = %s (runtime only, not saved)", onoff(modFreeCamera));
+    LOGI("mods: gameplay  | Skip cutscenes            = %s", onoff(modSkipCutscenes));
+    LOGI("mods: gameplay  | Infinite health           = %s", onoff(modInfiniteHealth));
+    LOGI("mods: gameplay  | Infinite lives            = %s", onoff(modInfiniteLives));
+    LOGI("mods: gameplay  | Infinite star bits        = %s", onoff(modInfiniteStarBits));
+    LOGI("mods: gameplay  | Game speed                = %dx", gameSpeed);
+    LOGI("mods: difficulty| Enemy damage              = x%d", diffEnemyDamage);
+    LOGI("mods: difficulty| Boss damage               = x%d", diffBossDamage);
+    LOGI("mods: difficulty| One-hit KO                = %s", onoff(diffOneHit));
+    LOGI("mods: difficulty| No healing                = %s", onoff(diffNoHeal));
+    LOGI("mods: difficulty| Max health stays 3        = %s", onoff(diffMaxHealth3));
+    LOGI("mods: camera    | Camera stick              = %s scale=%.2f opacity=%.2f sens=%.2f offset=%.0f,%.0f", onoff(showCamStick),
+         camStickScale, camStickOpacity, camStickSensitivity, camStickOffsetX, camStickOffsetY);
+    LOGI("mods: camera    | Camera RESET button       = %s scale=%.2f opacity=%.2f offset=%.0f,%.0f", onoff(showCamReset), camResetScale,
+         camResetOpacity, camResetOffsetX, camResetOffsetY);
+    LOGI("mods: camera    | Gyro camera               = %s sens=%.2f aiming=%s invert=%d/%d", onoff(gyroCamera), gyroCameraSens,
+         onoff(gyroAiming), gyroInvertX ? 1 : 0, gyroInvertY ? 1 : 0);
+    LOGI("mods: camera    | FOV offset                = %+d degrees", fovOffset);
+    LOGI("mods: graphics  | Adaptive quality          = %s", onoff(adaptiveQuality));
+    LOGI("mods: random    | Randomizer                = %s seed=%06d galaxies=%s missions=%s enemies=%s items=%s powerups=%s challenge=%s",
+         onoff(randoEnabled), randoSeed, onoff(randoGalaxies), onoff(randoStars), onoff(randoEnemies), onoff(randoItems),
+         onoff(randoPowerUps), onoff(randoChallenge));
+    LOGI("mods: ======== end of state ========");
 }
 
 void Settings::save(const std::string& path) const {
+    const auto before = readSettingsPairs(path);
     FILE* f = fopen(path.c_str(), "w");
-    if (!f) return;
+    if (!f) {
+        LOGE("Could not write settings to %s (errno %d)", path.c_str(), errno);
+        return;
+    }
     fprintf(f, "show_controls=%d\n", showControls ? 1 : 0);
     fprintf(f, "achievement_notifications=%d\n", achievementNotifications ? 1 : 0);
     fprintf(f, "fullscreen=%d\n", fullscreen ? 1 : 0);
@@ -506,6 +636,36 @@ void Settings::save(const std::string& path) const {
     fprintf(f, "mod_classic_gamepad_ui=%d\n", modClassicGamepadUI ? 1 : 0);
     fprintf(f, "mod_riivolution=%d\n", modRiivolution ? 1 : 0);
     fprintf(f, "mod_fly=%d\n", modFly ? 1 : 0);
+    fprintf(f, "mod_luigi=%d\n", modLuigi ? 1 : 0);
+    fprintf(f, "show_cam_stick=%d\n", showCamStick ? 1 : 0);
+    fprintf(f, "cam_stick_scale=%.2f\n", camStickScale);
+    fprintf(f, "cam_stick_opacity=%.2f\n", camStickOpacity);
+    fprintf(f, "cam_stick_sensitivity=%.2f\n", camStickSensitivity);
+    fprintf(f, "cam_stick_offset_x=%.1f\n", camStickOffsetX);
+    fprintf(f, "cam_stick_offset_y=%.1f\n", camStickOffsetY);
+    fprintf(f, "show_cam_reset=%d\n", showCamReset ? 1 : 0);
+    fprintf(f, "cam_reset_scale=%.2f\n", camResetScale);
+    fprintf(f, "cam_reset_opacity=%.2f\n", camResetOpacity);
+    fprintf(f, "cam_reset_offset_x=%.1f\n", camResetOffsetX);
+    fprintf(f, "cam_reset_offset_y=%.1f\n", camResetOffsetY);
+    fprintf(f, "gyro_camera=%d\n", gyroCamera ? 1 : 0);
+    fprintf(f, "gyro_camera_sens=%.2f\n", gyroCameraSens);
+    fprintf(f, "adaptive_quality=%d\n", adaptiveQuality ? 1 : 0);
+    fprintf(f, "log_enabled=%d\n", logEnabled ? 1 : 0);
+    fprintf(f, "diff_enemy_damage=%d\n", diffEnemyDamage);
+    fprintf(f, "diff_boss_damage=%d\n", diffBossDamage);
+    fprintf(f, "diff_one_hit=%d\n", diffOneHit ? 1 : 0);
+    fprintf(f, "diff_no_heal=%d\n", diffNoHeal ? 1 : 0);
+    fprintf(f, "diff_max_health_3=%d\n", diffMaxHealth3 ? 1 : 0);
+    fprintf(f, "rando_enabled=%d\n", randoEnabled ? 1 : 0);
+    fprintf(f, "rando_seed=%d\n", randoSeed);
+    fprintf(f, "rando_galaxies=%d\n", randoGalaxies ? 1 : 0);
+    fprintf(f, "rando_stars=%d\n", randoStars ? 1 : 0);
+    fprintf(f, "rando_enemies=%d\n", randoEnemies ? 1 : 0);
+    fprintf(f, "rando_items=%d\n", randoItems ? 1 : 0);
+    fprintf(f, "rando_powerups=%d\n", randoPowerUps ? 1 : 0);
+    fprintf(f, "rando_challenge=%d\n", randoChallenge ? 1 : 0);
+    fprintf(f, "fov_offset=%d\n", fovOffset);
     fprintf(f, "mod_skip_cutscenes=%d\n", modSkipCutscenes ? 1 : 0);
     fprintf(f, "mod_infinite_health=%d\n", modInfiniteHealth ? 1 : 0);
     fprintf(f, "mod_infinite_lives=%d\n", modInfiniteLives ? 1 : 0);
@@ -513,11 +673,33 @@ void Settings::save(const std::string& path) const {
     fprintf(f, "game_speed=%d\n", gameSpeed);
     fprintf(f, "language_choice=%d\n", languageChoice);
     fprintf(f, "render_scale=%d\n", renderScale);
+    fprintf(f, "antialiasing_level=%d\n", std::max(0, std::min(12, antialiasingLevel)));
     fprintf(f, "haptics=%d\n", haptics ? 1 : 0);
     fprintf(f, "target_fps=%d\n", targetFps);
     fprintf(f, "adaptive_fps=%d\n", adaptiveFps ? 1 : 0);
     fclose(f);
-    LOGI("Saved settings to %s", path.c_str());
+    // Log what actually changed instead of one identical line per save.
+    const auto after = readSettingsPairs(path);
+    std::string changes;
+    int count = 0;
+    for (const auto& kv : after) {
+        const std::string* old = nullptr;
+        for (const auto& b : before) {
+            if (b.first == kv.first) { old = &b.second; break; }
+        }
+        if (old && *old == kv.second) continue;
+        count++;
+        if (count <= 12) {
+            if (!changes.empty()) changes += ", ";
+            changes += kv.first + (old ? ": " + *old + " -> " : " = ") + kv.second;
+        }
+    }
+    if (before.empty()) {
+        LOGI("Saved settings (first write, %zu values) to %s", after.size(), path.c_str());
+    } else if (count > 0) {
+        LOGI("Saved settings, %d changed: %s%s", count, changes.c_str(), count > 12 ? ", ..." : "");
+        logMods("after a settings change");
+    }
 }
 
 
@@ -538,6 +720,7 @@ void UIOverlay::setSavePath(const std::string& path) {
     port_input_set_camera_inverted(mSettings.cameraInvertX ? 1 : 0);
     port_input_set_camera_invert_y(mSettings.cameraInvertY ? 1 : 0);
     applyGameSpeed(mSettings.gameSpeed);
+    applySkipCutscenes(mSettings.modSkipCutscenes);
     applyLanguage(mSettings.languageChoice);
     applyTargetFps(mSettings.batterySaver ? 30 : mSettings.targetFps);
 }
@@ -568,6 +751,7 @@ void UIOverlay::loadAchievementStats() {
     mAchievementFirstGameStarted = false;
     mAchievementTotalPlayedSeconds = 0;
     mAchievementLastPlayedEpochSeconds = 0;
+    mAch.clearProgressForLoad();
     if (mAchievementsPath.empty()) return;
 
     FILE* file = fopen(mAchievementsPath.c_str(), "r");
@@ -575,7 +759,7 @@ void UIOverlay::loadAchievementStats() {
         LOGI("achievements: no saved stats yet; starting local record");
         return;
     }
-    char line[128];
+    char line[256];
     while (fgets(line, sizeof(line), file)) {
         char* equals = strchr(line, '=');
         if (!equals) continue;
@@ -588,12 +772,15 @@ void UIOverlay::loadAchievementStats() {
             mAchievementTotalPlayedSeconds = strtoull(equals, nullptr, 10);
         } else if (!strcmp(line, "last_played_epoch")) {
             mAchievementLastPlayedEpochSeconds = strtoll(equals, nullptr, 10);
+        } else {
+            mAch.loadLine(line, equals);
         }
     }
     fclose(file);
-    LOGI("achievements: loaded local progress first_game=%d total_seconds=%llu",
+    LOGI("achievements: loaded local progress first_game=%d total_seconds=%llu unlocked=%d/%zu",
          mAchievementFirstGameStarted ? 1 : 0,
-         static_cast<unsigned long long>(mAchievementTotalPlayedSeconds));
+         static_cast<unsigned long long>(mAchievementTotalPlayedSeconds),
+         mAch.unlockedCount(), mAch.count());
 }
 
 void UIOverlay::saveAchievementStats() {
@@ -609,6 +796,7 @@ void UIOverlay::saveAchievementStats() {
                       mAchievementFirstGameStarted ? 1 : 0,
                       static_cast<unsigned long long>(mAchievementTotalPlayedSeconds),
                       static_cast<long long>(mAchievementLastPlayedEpochSeconds)) > 0;
+    mAch.saveLines(file);
     if (fflush(file) != 0 || fsync(fileno(file)) != 0) ok = false;
     if (fclose(file) != 0) ok = false;
     if (!ok || rename(temporaryPath.c_str(), mAchievementsPath.c_str()) != 0) {
@@ -630,16 +818,16 @@ void UIOverlay::setGameplayActive(bool active) {
         mAchievementLastPlayedEpochSeconds = static_cast<int64_t>(time(nullptr));
         if (!mAchievementFirstGameStarted) {
             mAchievementFirstGameStarted = true;
-            LOGI("achievements: unlocked First Adventure (first gameplay scene started)");
-            if (mSettings.achievementNotifications) {
-                mAchievementToastMessage = achievementsUseSpanish()
-                    ? "Logro desbloqueado: Primera aventura"
-                    : "Achievement unlocked: First Adventure";
-                mAchievementToastUntilMs = nowMs + 3000;
-                mDirty = true;
-            }
+            LOGI("achievements: first gameplay scene started");
+        }
+        {
+            const time_t today = time(nullptr);
+            struct tm local{};
+            localtime_r(&today, &local);
+            mAch.onDayPlayed((local.tm_year + 1900) * 10000 + (local.tm_mon + 1) * 100 + local.tm_mday);
         }
         LOGI("achievements: gameplay session started");
+        evaluateAchievements();
         saveAchievementStats();
     } else {
         const uint64_t elapsedSeconds =
@@ -684,9 +872,120 @@ void UIOverlay::resumeAchievementSession() {
     saveAchievementStats();
 }
 
+uint64_t UIOverlay::achievementPlaySeconds() const {
+    uint64_t seconds = mAchievementTotalPlayedSeconds;
+    if (mAchievementGameplayActive) {
+        const int64_t nowMs = currentTimeMs();
+        if (nowMs > mAchievementSessionStartMs) {
+            seconds += static_cast<uint64_t>(nowMs - mAchievementSessionStartMs) / 1000;
+        }
+    }
+    return seconds;
+}
+
+// Checks every achievement against the current facts; queues one notification
+// for each new unlock (a single summary when many unlock at once).
+void UIOverlay::evaluateAchievements() {
+    const std::vector<int> fresh =
+        mAch.evaluate(achievementPlaySeconds(), mAchievementFirstGameStarted, static_cast<int64_t>(time(nullptr)));
+    if (fresh.empty()) return;
+    const bool spanish = achievementsUseSpanish();
+    const std::vector<achv::Def>& defs = achv::defs();
+    for (int index : fresh) {
+        LOGI("achievements: unlocked '%s' (%s), %d/%zu unlocked", defs[(size_t)index].id,
+             defs[(size_t)index].en, mAch.unlockedCount(), mAch.count());
+    }
+    if (mSettings.achievementNotifications) {
+        std::lock_guard<std::mutex> lock(mAchToastLock);
+        if (fresh.size() > 4) {
+            AchToast t;
+            t.title = spanish ? "LOGROS DESBLOQUEADOS" : "ACHIEVEMENTS UNLOCKED";
+            char name[64];
+            snprintf(name, sizeof(name), spanish ? "%zu logros nuevos" : "%zu new achievements", fresh.size());
+            t.name = name;
+            t.desc = spanish ? "Revisa Ajustes > Logros para ver todos." : "See Settings > Achievements for the list.";
+            mAchToastQueue.push_back(t);
+        } else {
+            for (int index : fresh) {
+                const achv::Def& d = defs[(size_t)index];
+                AchToast t;
+                t.title = spanish ? "LOGRO DESBLOQUEADO" : "ACHIEVEMENT UNLOCKED";
+                t.name = spanish ? d.es : d.en;
+                t.desc = spanish ? d.descEs : d.descEn;
+                mAchToastQueue.push_back(t);
+            }
+        }
+    }
+    saveAchievementStats();
+    mDirty = true;
+}
+
+std::vector<int> UIOverlay::achievementFilteredList() const {
+    std::vector<int> list;
+    const uint64_t seconds = achievementPlaySeconds();
+    const size_t total = achv::defs().size();
+    for (size_t i = 0; i < total; i++) {
+        const bool unlocked = mAch.isUnlocked(i);
+        if (mAchFilter == 1 && unlocked) continue;
+        if (mAchFilter == 2 && !unlocked) continue;
+        list.push_back((int)i);
+    }
+    (void)seconds;
+    return list;
+}
+
+namespace {
+constexpr float kAchListTop = 476.0f;   // where the achievement list starts in the tab
+constexpr float kAchItemH = 88.0f;
+}
+
+float UIOverlay::achievementsTabContentHeight() const {
+    return kAchListTop + (float)achievementFilteredList().size() * kAchItemH + 40.0f;
+}
+
+void UIOverlay::achievementPoll(int userFile, int stars, int starMax, int grandStars, int starBits, int coins, int lives) {
+    mAch.onPoll(userFile, stars, starMax, grandStars, starBits, coins, lives);
+}
+
+void UIOverlay::achievementStage(const char* stage, bool luigi) {
+    LOGI("achievements: entered stage '%s'%s", stage ? stage : "(none)", luigi ? " as Luigi" : "");
+    mAch.onStage(stage, luigi);
+    evaluateAchievements();
+}
+
+void UIOverlay::achievementEvent(const char* kind, const char* a, const char* b, int n) {
+    if (!kind) return;
+    if (!strcmp(kind, "star_request")) {
+        const std::string boss = mAch.onStarRequested(a, b);
+        LOGI("achievements: Power Star raised by object '%s' in stage '%s' (scenario %d)%s%s", a ? a : "?",
+             b ? b : "?", n, boss.empty() ? "" : " -> boss ", boss.c_str());
+    } else if (!strcmp(kind, "comet")) {
+        mAch.onComet();
+        LOGI("achievements: comet scenario '%s' entered in stage '%s' (scenario %d)", a ? a : "?", b ? b : "?", n);
+    } else if (!strcmp(kind, "death")) {
+        mAch.onDeath();
+        LOGI("achievements: life lost in stage '%s'", a ? a : "?");
+    } else if (!strcmp(kind, "ending")) {
+        {
+            const bool randomized = port_rando_active() != 0;
+            mAch.onEnding(randomized, randomized && mSettings.randoChallenge);
+            if (randomized) {
+                LOGI("achievements: story ending reached with the randomizer on (seed %06d, challenge=%d)",
+                     mSettings.randoSeed, mSettings.randoChallenge ? 1 : 0);
+            }
+        }
+        LOGI("achievements: story ending reached");
+    }
+    evaluateAchievements();
+}
+
 void UIOverlay::tickAchievementSession() {
     if (!mAchievementGameplayActive) return;
     const int64_t nowMs = currentTimeMs();
+    if (nowMs - mAchLastEvalMs >= 1000) {
+        mAchLastEvalMs = nowMs;
+        evaluateAchievements();
+    }
     if (nowMs - mAchievementLastPersistMs < 30000) return;
     if (nowMs > mAchievementSessionStartMs) {
         const uint64_t elapsedSeconds =
@@ -701,6 +1000,10 @@ void UIOverlay::tickAchievementSession() {
 
 void UIOverlay::reportFramePresented() {
     mFpsFrameCounter++;
+}
+
+void UIOverlay::reportGameFramePresented() {
+    mGameFrameCounter++;
 }
 
 bool UIOverlay::needsRedraw() {
@@ -796,6 +1099,19 @@ extern "C" void port_mobile_achievement_tick(void) {
     UIOverlay::get().tickAchievementSession();
 }
 
+extern "C" void port_mobile_achievement_poll(int userFile, int stars, int starMax, int grandStars, int starBits,
+                                             int coins, int lives) {
+    UIOverlay::get().achievementPoll(userFile, stars, starMax, grandStars, starBits, coins, lives);
+}
+
+extern "C" void port_mobile_achievement_stage(const char* stage, int luigi) {
+    UIOverlay::get().achievementStage(stage, luigi != 0);
+}
+
+extern "C" void port_mobile_achievement_event(const char* kind, const char* a, const char* b, int n) {
+    UIOverlay::get().achievementEvent(kind, a, b, n);
+}
+
 void UIOverlay::showToast(const std::string& msg) {
     mToastMessage = msg;
     mSaveToastTimer = 2.8f;
@@ -813,6 +1129,9 @@ void UIOverlay::setGamepadConnected(bool connected) {
         mTouchPointerId = -1;
         mTouchStickX = 0.0f;
         mTouchStickY = 0.0f;
+        mCamStickPointerId = -1;
+        mCamStickX = 0.0f;
+        mCamStickY = 0.0f;
         mTapPendingFrames = 0;
         mFingerDownOnA = mFingerDownOnB = mFingerDownOnZ = false;
         mFingerDownOnSpin = mFingerDownOnPlus = false;
@@ -1095,13 +1414,17 @@ void UIOverlay::update(PortPadState& pad, int& spinFrames) {
     int64_t diffNs = nowNs - mFpsLastTimeNs;
     if (diffNs >= 500000000ll) { // Sample every 500ms
         float sec = (float)diffNs / 1e9f;
+        // mCurrentFps counts every image sent to the screen (repeats and menu
+        // redraws included); mGameFps counts only new frames the game produced.
+        // Neither is clamped to the target: the HUD shows what was measured.
         mCurrentFps = (float)mFpsFrameCounter / sec;
-        int activeTargetFps = mSettings.batterySaver ? 30 : mSettings.targetFps;
-        if (port_get_game_speed() <= 1.05f && mCurrentFps > (float)activeTargetFps) {
-            mCurrentFps = (float)activeTargetFps;
-        }
-        mAvgFrameTimeMs = 1000.0f / (mCurrentFps > 1.0f ? mCurrentFps : 1.0f);
+        mGameFps = (float)mGameFrameCounter / sec;
+        // While nothing new is produced (paused, menu) the game rate is 0, so
+        // the frame time follows the screen rate instead of dividing by zero.
+        const float frameRate = mGameFps > 1.0f ? mGameFps : mCurrentFps;
+        mAvgFrameTimeMs = 1000.0f / (frameRate > 1.0f ? frameRate : 1.0f);
         mFpsFrameCounter = 0;
+        mGameFrameCounter = 0;
         mFpsLastTimeNs = nowNs;
 
         // Sample CPU usage:
@@ -1251,6 +1574,54 @@ UIOverlay::ButtonLayout UIOverlay::buttonLayout(int screenW, int screenH) const 
     return l;
 }
 
+void UIOverlay::camStickGeometry(int screenW, int screenH, float& cx, float& cy, float& r) const {
+    const float baseDpi = (float)screenH / 650.0f;
+    const float scale = baseDpi * mSettings.scale;
+    const float w = (float)screenW;
+    const float h = (float)screenH;
+    const ButtonLayout bl = buttonLayout(screenW, screenH);
+
+    if (mSettings.dpadOnRight) {
+        // The camera D-pad sits at the top right: take the free top-left corner.
+        r = std::min(58.0f * scale * mSettings.camStickScale, h * 0.20f);
+        cx = 130.0f * scale;
+        cy = 160.0f * scale;
+    } else {
+        // Top-right band between the pause button and the SPIN / Z buttons.
+        const float bandTop = bl.pauseY + bl.pauseR + 6.0f * scale;
+        const float bandBottom = std::min(bl.spinY - bl.spinR, bl.zy - bl.zr) - 6.0f * scale;
+        const float band = std::max(60.0f * scale, bandBottom - bandTop);
+        r = std::min(54.0f * scale * mSettings.camStickScale, band * 0.5f);
+        cx = w - r - 24.0f * scale;
+        cy = bandTop + band * 0.5f;
+    }
+    cx += mSettings.camStickOffsetX;
+    cy += mSettings.camStickOffsetY;
+    // Never leave the screen, whatever the offsets or the size.
+    r = std::max(24.0f, std::min(r, std::min(w, h) * 0.30f));
+    cx = std::max(r, std::min(w - r, cx));
+    cy = std::max(r, std::min(h - r, cy));
+}
+
+void UIOverlay::camResetGeometry(int screenW, int screenH, float& cx, float& cy, float& r) const {
+    float sx = 0.0f, sy = 0.0f, sr = 0.0f;
+    camStickGeometry(screenW, screenH, sx, sy, sr);
+    const float baseDpi = (float)screenH / 650.0f;
+    const float scale = baseDpi * mSettings.scale;
+    r = std::max(18.0f, 25.0f * scale * mSettings.camResetScale);
+    const float gap = 8.0f * scale;
+    // Toward the middle of the screen, so it never runs off the edge.
+    const bool leftSide = sx > (float)screenW * 0.5f;
+    cx = leftSide ? sx - sr - r - gap : sx + sr + r + gap;
+    cy = sy;
+    cx += mSettings.camResetOffsetX;
+    cy += mSettings.camResetOffsetY;
+    cx = std::max(r, std::min((float)screenW - r, cx));
+    cy = std::max(r, std::min((float)screenH - r, cy));
+}
+
+extern "C" void port_mobile_request_camera_reset(void);
+
 bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& spinFrames,
                             int screenW, int screenH, int vpX, int vpY, int vpW, int vpH) {
     int32_t eventType = AInputEvent_getType(event);
@@ -1301,12 +1672,23 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
                                    px >= dialogX0 + 16.0f * uiScale &&
                                    px <= dialogX1 - 16.0f * uiScale;
             if (onButtons && px > splitX) {
-                mAchievementFirstGameStarted = false;
+                const uint64_t seconds = achievementPlaySeconds();
+                if (mAchResetIndex < 0) {
+                    mAch.resetAll(seconds, mAchievementFirstGameStarted);
+                    mAchievementFirstGameStarted = false;
+                    LOGI("achievements: user reset every achievement; playtime retained");
+                    showToast(achievementsUseSpanish()
+                                  ? "Logros reiniciados; tiempo jugado conservado"
+                                  : "Achievements reset; playtime kept");
+                } else {
+                    const achv::Def& d = achv::defs()[(size_t)mAchResetIndex];
+                    mAch.resetOne((size_t)mAchResetIndex, seconds, mAchievementFirstGameStarted);
+                    if (d.metric == achv::M_FIRST_GAME) mAchievementFirstGameStarted = false;
+                    LOGI("achievements: user reset '%s'", d.id);
+                    showToast(achievementsUseSpanish() ? std::string("Logro reiniciado: ") + d.es
+                                                       : std::string("Achievement reset: ") + d.en);
+                }
                 saveAchievementStats();
-                LOGI("achievements: user cleared earned achievement flags; playtime retained");
-                showToast(achievementsUseSpanish()
-                              ? "Logros borrados; tiempo jugado conservado"
-                              : "Achievements cleared; playtime kept");
             }
             mAchievementClearConfirm = false;
             mDirty = true;
@@ -1388,6 +1770,7 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
             float py = AMotionEvent_getY(event, pointerIndex);
             if (px >= 0.0f && px <= tabW + 16.0f * uiScale && py >= tabY - 8.0f * uiScale && py <= tabY + tabH + 8.0f * uiScale) {
                 mSettingsOpen = true;
+                LOGI("ui: settings drawer opened (tab %d)", mSettingsTab);
                 mBtnCfgPressed = true;
                 mDirty = true;
                 return true;
@@ -1473,7 +1856,27 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
             float dDpad2 = (px - curDpadX) * (px - curDpadX) + (py - curDpadY) * (py - curDpadY);
             float dStick2 = (px - curStickX) * (px - curStickX) + (py - curStickY) * (py - curStickY);
 
-            if (mSettings.showDpad && dDpad2 <= (95.0f * scale) * (95.0f * scale)) {
+            float camCx = 0.0f, camCy = 0.0f, camR = 0.0f;
+            camStickGeometry(screenW, screenH, camCx, camCy, camR);
+            const float dCam2 = (px - camCx) * (px - camCx) + (py - camCy) * (py - camCy);
+
+            float rstX = 0.0f, rstY = 0.0f, rstR = 0.0f;
+            camResetGeometry(screenW, screenH, rstX, rstY, rstR);
+            const float dRst2 = (px - rstX) * (px - rstX) + (py - rstY) * (py - rstY);
+
+            if (mSettings.showCamReset && dRst2 <= (rstR * 1.4f) * (rstR * 1.4f)) {
+                mDraggingCluster = 5; // reset-camera button
+                mDragStartX = px;
+                mDragStartY = py;
+                mInitialResetOfsX = mSettings.camResetOffsetX;
+                mInitialResetOfsY = mSettings.camResetOffsetY;
+            } else if (mSettings.showCamStick && dCam2 <= (camR * 1.35f) * (camR * 1.35f)) {
+                mDraggingCluster = 4; // camera joystick
+                mDragStartX = px;
+                mDragStartY = py;
+                mInitialCamOfsX = mSettings.camStickOffsetX;
+                mInitialCamOfsY = mSettings.camStickOffsetY;
+            } else if (mSettings.showDpad && dDpad2 <= (95.0f * scale) * (95.0f * scale)) {
                 mDraggingCluster = 3; // D-Pad
                 mDragStartX = px;
                 mDragStartY = py;
@@ -1532,6 +1935,12 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
             } else if (mDraggingCluster == 3) {
                 mSettings.dpadOffsetX = mInitialDpadOfsX + (px - mDragStartX);
                 mSettings.dpadOffsetY = mInitialDpadOfsY + (py - mDragStartY);
+            } else if (mDraggingCluster == 4) {
+                mSettings.camStickOffsetX = mInitialCamOfsX + (px - mDragStartX);
+                mSettings.camStickOffsetY = mInitialCamOfsY + (py - mDragStartY);
+            } else if (mDraggingCluster == 5) {
+                mSettings.camResetOffsetX = mInitialResetOfsX + (px - mDragStartX);
+                mSettings.camResetOffsetY = mInitialResetOfsY + (py - mDragStartY);
             }
             mDirty = true;
             return true;
@@ -1566,10 +1975,10 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
         float contentTop = 112.0f * uiScale;
         float contentBottom = h - 56.0f * uiScale;
         const bool showingGeneralTab = mSettingsTab == 0;
-        float totalContentH = showingGeneralTab ? (1540.0f * uiScale) :
-                              (mSettingsTab == 4 ? (560.0f * uiScale) :
-                               (mSettingsTab == 3 ? (950.0f * uiScale) :
-                               ((mPlusEdition && mSettingsTab == 1) ? (760.0f * uiScale) : (580.0f * uiScale))));
+        float totalContentH = showingGeneralTab ? ((1600.0f + kAntialiasingRowHeight) * uiScale) :
+                              (mSettingsTab == 4 ? (achievementsTabContentHeight() * uiScale) :
+                               (mSettingsTab == 3 ? (1510.0f * uiScale) :
+                                (mSettingsTab == 1 ? (modsTabContentHeight() * uiScale) : (580.0f * uiScale))));
         float maxScroll = std::max(0.0f, totalContentH - (contentBottom - contentTop));
 
         // 1. Move Gesture for Smooth Scrolling
@@ -1599,9 +2008,35 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
                     float contentRelY = py - contentTop + mDrawerScrollY;
 
                     if (mSettingsTab == 0) {
+                        const float aaRowTop = 950.0f * uiScale;
+                        const float aaRowBottom = aaRowTop + kAntialiasingRowHeight * uiScale;
+                        const bool hitAaRow = contentRelY >= aaRowTop && contentRelY < aaRowBottom;
+                        // Rows after the inserted AA control are shifted down in the
+                        // visual layout; map their taps back to the established hitboxes.
+                        if (contentRelY >= aaRowBottom) {
+                            contentRelY -= kAntialiasingRowHeight * uiScale;
+                        }
                         // General Tab items
                         // Row 0: Quick Save / Quick Load Anywhere Action Buttons
-                        if (contentRelY >= 0.0f && contentRelY <= 52.0f * uiScale) {
+                        if (hitAaRow) {
+                            const int direction = px < drawerX + drawerW * 0.5f ? -1 : 1;
+                            const int nextLevel = std::max(0, std::min(12, mSettings.antialiasingLevel + direction));
+                            if (nextLevel != mSettings.antialiasingLevel) {
+                                mSettings.antialiasingLevel = nextLevel;
+                                if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                mDirty = true;
+                                LOGI("FXAA post-process quality changed to %d/12; render resolution is unchanged",
+                                     nextLevel);
+                                char message[64];
+                                if (nextLevel == 0) {
+                                    snprintf(message, sizeof(message), "FXAA: OFF");
+                                } else {
+                                    snprintf(message, sizeof(message), "FXAA quality: x%d", nextLevel);
+                                }
+                                showToast(message);
+                            }
+                        }
+                        else if (contentRelY >= 0.0f && contentRelY <= 52.0f * uiScale) {
                             float midX = drawerX + padX + contentW * 0.5f;
                             if (px < midX) {
                                 triggerSaveSlot(4, true);
@@ -1715,34 +2150,9 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
                             else if (idx == 1) mSettings.perfHudMode = 1; // FPS
                             else mSettings.perfHudMode = 2; // Full Stats
                         }
-                        // Row 12: Target Frame Rate
+                        // Row 12: Target Frame Rate (fixed at the game's native 60 FPS)
                         else if (contentRelY >= 660.0f * uiScale && contentRelY < 718.0f * uiScale) {
-                            float segW = contentW / 5.0f;
-                            float relX = px - (drawerX + padX);
-                            int idx = std::max(0, std::min(4, (int)(relX / segW)));
-                            if (idx == 0) {
-                                mSettings.targetFps = 30;
-                                mSettings.batterySaver = true;
-                                showToast("30 FPS + render target capped at 720p (Battery Saver)");
-                            } else if (idx == 1) {
-                                mSettings.targetFps = 60;
-                                mSettings.batterySaver = false;
-                                showToast("Target FPS: 60 FPS (Native Standard)");
-                            } else if (idx == 2) {
-                                mSettings.targetFps = 90;
-                                mSettings.batterySaver = false;
-                                showToast("Target FPS: 90 FPS (Smooth Refresh)");
-                            } else if (idx == 3) {
-                                mSettings.targetFps = 120;
-                                mSettings.batterySaver = false;
-                                showToast("Target FPS: 120 FPS (Ultra Smooth)");
-                            } else {
-                                mSettings.targetFps = 144;
-                                mSettings.batterySaver = false;
-                                showToast("Target FPS: 144 FPS (Max Refresh)");
-                            }
-                            if (!mSavePath.empty()) mSettings.save(mSavePath);
-                            mDirty = true;
+                            showToast("60 FPS: velocidad nativa del juego");
                         }
                         // Row 13: Graphics Backend
                         else if (contentRelY >= 718.0f * uiScale && contentRelY < 776.0f * uiScale) {
@@ -1791,20 +2201,9 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
                                       mSettings.renderScale == 3 ? "Resolution: 1440p (2K Ultra)" :
                                       "Resolution: 4K (3840px long edge; high heat/battery use)");
                         }
-                        // Row 16b: Display Refresh Rate & Framerate
+                        // Row 16b: Display Refresh Rate & Framerate (fixed at the native 60)
                         else if (contentRelY >= 950.0f * uiScale && contentRelY < 1008.0f * uiScale) {
-                            float segW = contentW / 4.0f;
-                            int idx = (int)((px - (drawerX + padX)) / segW);
-                            int fps = (idx == 0) ? 60 : (idx == 1) ? 90 : (idx == 2) ? 120 : 144;
-                            mSettings.targetFps = fps;
-                            mSettings.batterySaver = false;
-                            applyTargetFps(fps);
-                            if (!mSavePath.empty()) mSettings.save(mSavePath);
-                            mDirty = true;
-                            showToast(fps == 60 ? "Framerate: 60 Hz (Standard)" :
-                                      fps == 90 ? "Framerate: 90 Hz (Smooth High-Refresh)" :
-                                      fps == 120 ? "Framerate: 120 Hz (Ultra Smooth Native Pacing)" :
-                                      "Framerate: 144 Hz (Extreme Refresh Rate)");
+                            showToast("60 Hz: velocidad nativa del juego");
                         }
                         // Row 17: Vibration Haptics
                         else if (contentRelY >= 1008.0f * uiScale && contentRelY < 1062.0f * uiScale) {
@@ -1867,80 +2266,258 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
                                 importSave();
                             }
                         }
+                        // Row 21b: log on/off
+                        else if (contentRelY >= 1468.0f * uiScale && contentRelY < 1526.0f * uiScale) {
+                            if (mSettings.logEnabled) {
+                                LOGI("log: turned OFF from settings; only ERROR/FATAL lines will be kept");
+                                mSettings.logEnabled = false;
+                                port_log_set_enabled(0);
+                            } else {
+                                mSettings.logEnabled = true;
+                                port_log_set_enabled(1);
+                                LOGI("log: turned back ON from settings");
+                            }
+                            if (!mSavePath.empty()) mSettings.save(mSavePath);
+                            showToast(mSettings.logEnabled ? "Registro (log) activado" : "Registro (log) apagado");
+                        }
                         // Row 22: Return to Setup / Launcher Button
-                        else if (contentRelY >= 1468.0f * uiScale && contentRelY < 1548.0f * uiScale) {
+                        else if (contentRelY >= 1528.0f * uiScale && contentRelY < 1608.0f * uiScale) {
                             mSettingsOpen = false;
                             port_android_exit_to_launcher();
                             return true;
                         }
-                    } else if (mPlusEdition && mSettingsTab == 1) {
-                        // Mod Manager Tab items
-                        // Row 1: NVIDIA Shield HD Textures
-                        if (contentRelY >= 48.0f * uiScale && contentRelY <= 100.0f * uiScale) {
-                            mSettings.modShieldTextures = !mSettings.modShieldTextures;
-                            showToast(mSettings.modShieldTextures ? "Shield HD Textures: ENABLED (1080p)" : "Shield HD Textures: DISABLED");
-                        }
-                        // Row 2: NVIDIA Shield 60FPS Cutscenes
-                        else if (contentRelY >= 102.0f * uiScale && contentRelY <= 154.0f * uiScale) {
-                            mSettings.modShieldCutscenes = !mSettings.modShieldCutscenes;
-                            showToast(mSettings.modShieldCutscenes ? "Shield 60FPS Cutscenes: ENABLED" : "Shield 60FPS Cutscenes: DISABLED");
-                        }
-                        // Row 3: Shield Controller Curves
-                        else if (contentRelY >= 156.0f * uiScale && contentRelY <= 208.0f * uiScale) {
-                            mSettings.modShieldControls = !mSettings.modShieldControls;
-                            showToast(mSettings.modShieldControls ? "Shield Calibrated Analog: ENABLED" : "Shield Calibrated Analog: OFF");
-                        }
-                        // Row 4: Classic Gamepad ABXY Prompts
-                        else if (contentRelY >= 210.0f * uiScale && contentRelY <= 262.0f * uiScale) {
-                            mSettings.modClassicGamepadUI = !mSettings.modClassicGamepadUI;
-                            showToast(mSettings.modClassicGamepadUI ? "Gamepad ABXY Prompts: ENABLED" : "Gamepad ABXY Prompts: DISABLED");
-                        }
-                        // Row 5: Fly Mode Switch
-                        else if (contentRelY >= 264.0f * uiScale && contentRelY <= 316.0f * uiScale) {
-                            mSettings.modFly = !mSettings.modFly;
-                            showToast(mSettings.modFly ? "Fly Mode: ON (Hold A/Z)" : "Fly Mode: OFF");
-                        }
-                        // Row 6: Cutscene Prevention Switch
-                        else if (contentRelY >= 318.0f * uiScale && contentRelY <= 370.0f * uiScale) {
-                            mSettings.modSkipCutscenes = !mSettings.modSkipCutscenes;
-                            showToast(mSettings.modSkipCutscenes ? "Skip Cutscenes: ON" : "Skip Cutscenes: OFF");
-                        }
-                        // Row 7: Infinite Health Switch
-                        else if (contentRelY >= 372.0f * uiScale && contentRelY <= 424.0f * uiScale) {
-                            mSettings.modInfiniteHealth = !mSettings.modInfiniteHealth;
-                            showToast(mSettings.modInfiniteHealth ? "Infinite Health: ON (God Mode)" : "Infinite Health: OFF");
-                        }
-                        // Row 8: Infinite Lives Switch
-                        else if (contentRelY >= 426.0f * uiScale && contentRelY <= 478.0f * uiScale) {
-                            mSettings.modInfiniteLives = !mSettings.modInfiniteLives;
-                            showToast(mSettings.modInfiniteLives ? "Infinite Lives (99): ON" : "Infinite Lives: OFF");
-                        }
-                        // Row 9: Infinite Star Bits Switch
-                        else if (contentRelY >= 480.0f * uiScale && contentRelY <= 532.0f * uiScale) {
-                            mSettings.modInfiniteStarBits = !mSettings.modInfiniteStarBits;
-                            showToast(mSettings.modInfiniteStarBits ? "Infinite Star Bits (999): ON" : "Infinite Star Bits: OFF");
-                        }
-                        // Row 10: Turbo Game Speed Multiplier
-                        else if (contentRelY >= 534.0f * uiScale && contentRelY < 592.0f * uiScale) {
-                            float segW = contentW / 5.0f;
-                            int idx = (int)((px - (drawerX + padX)) / segW);
-                            mSettings.gameSpeed = std::max(1, std::min(5, idx + 1));
-                            applyGameSpeed(mSettings.gameSpeed);
-                            showToast(mSettings.gameSpeed == 1 ? "Game Speed: 1.0x (Normal)" :
-                                      mSettings.gameSpeed == 2 ? "Game Speed: 1.5x" :
-                                      mSettings.gameSpeed == 3 ? "Game Speed: 2.0x (Fast)" :
-                                      mSettings.gameSpeed == 4 ? "Game Speed: 3.0x" : "Game Speed: 4.0x (Turbo)");
-                        }
-                        // Row 11: Riivolution Mods Switch
-                        else if (contentRelY >= 594.0f * uiScale && contentRelY <= 646.0f * uiScale) {
+                    } else if (mSettingsTab == 1) {
+                        if (contentRelY >= 38.0f * uiScale && contentRelY < 88.0f * uiScale) {
                             mSettings.modRiivolution = !mSettings.modRiivolution;
-                            showToast(mSettings.modRiivolution ? "Riivolution Mods: ON (/sdcard/GalaxyData/mods)" : "Riivolution Mods: OFF");
-                        }
-                        // Row 12: Scan & Reload Mods Button
-                        else if (contentRelY >= 648.0f * uiScale && contentRelY <= 704.0f * uiScale) {
-                            mkdir("/sdcard/GalaxyData", 0775);
-                            mkdir("/sdcard/GalaxyData/mods", 0775);
-                            showToast("Scanned /sdcard/GalaxyData/mods: Active!");
+                            port_mods::setGlobalEnabled(mSettings.modRiivolution);
+                            showToast(mSettings.modRiivolution
+                                ? "Mods locales activados; reinicia el juego para aplicarlos"
+                                : "Mods locales desactivados; reinicia el juego");
+                            LOGI("mods: global resource overlays %s (takes effect on next game start)",
+                                 mSettings.modRiivolution ? "enabled" : "disabled");
+                        } else if (contentRelY >= 92.0f * uiScale && contentRelY < 142.0f * uiScale) {
+                            const float cellWidth = contentW / 3.0f;
+                            if (px < drawerX + padX + cellWidth) {
+                                const std::string path = port_mods::modsDirectory();
+                                if (port_android_choose_mod_zip(path.c_str()) > 0) {
+                                    showToast("Selecciona un ZIP de recursos compatible");
+                                } else {
+                                    showToast("No se pudo abrir el selector de ZIP");
+                                }
+                            } else if (px < drawerX + padX + cellWidth * 2.0f) {
+                                port_mods::refresh();
+                                char message[80];
+                                snprintf(message, sizeof(message), "Escaneo: %zu mod(s) compatible(s)",
+                                         port_mods::list()->size());
+                                showToast(message);
+                            } else {
+                                const std::string path = port_mods::modsDirectory();
+                                if (port_android_copy_to_clipboard(path.c_str(), (int)path.size()) > 0) {
+                                    showToast("Ruta de mods copiada");
+                                } else {
+                                    showToast("No se pudo copiar la ruta");
+                                }
+                            }
+                        } else {
+                            const auto mods = port_mods::list();
+                            if (mods->empty() && contentRelY >= kModsListStartY * uiScale &&
+                                contentRelY < (kModsListStartY + 100.0f) * uiScale) {
+                                showToast("Usa mod.ini y files/ dentro de cada carpeta de mod");
+                            } else if (!mods->empty() &&
+                                       contentRelY >= kModsListStartY * uiScale &&
+                                       contentRelY < (kModsListStartY + mods->size() * kModsRowPitch) * uiScale) {
+                                const int index = (int)((contentRelY / uiScale - kModsListStartY) / kModsRowPitch);
+                                if (index >= 0 && (size_t)index < mods->size()) {
+                                    const port_mods::ModInfo mod = (*mods)[(size_t)index];
+                                    if (port_mods::setEnabled(mod.id, !mod.enabled)) {
+                                        if (mod.enabled) {
+                                            showToast("Mod desactivado; reinicia el juego");
+                                        } else if (!mSettings.modRiivolution) {
+                                            showToast("Mod guardado; activa Mods locales y reinicia");
+                                        } else {
+                                            showToast("Mod activado; reinicia el juego");
+                                        }
+                                    } else {
+                                        showToast("No se pudo cambiar el estado del mod");
+                                    }
+                                }
+                            } else {
+                                const float extrasTop = modsExtrasStartY() * uiScale;
+                                if (contentRelY >= extrasTop && contentRelY < extrasTop + 52.0f * uiScale) {
+                                    mSettings.modFly = !mSettings.modFly;
+                                    showToast(mSettings.modFly ? "Modo vuelo activado" : "Modo vuelo desactivado");
+                                } else if (contentRelY >= extrasTop + 58.0f * uiScale &&
+                                           contentRelY < extrasTop + 116.0f * uiScale) {
+                                    const float segW = contentW / 5.0f;
+                                    const int idx = std::max(0, std::min(4,
+                                        (int)((px - (drawerX + padX)) / segW)));
+                                    mSettings.gameSpeed = idx + 1;
+                                    applyGameSpeed(mSettings.gameSpeed);
+                                    showToast(mSettings.gameSpeed == 1 ? "Velocidad normal" :
+                                        mSettings.gameSpeed == 2 ? "Velocidad 1.5x" :
+                                        mSettings.gameSpeed == 3 ? "Velocidad 2x" :
+                                        mSettings.gameSpeed == 4 ? "Velocidad 3x" : "Velocidad 4x");
+                                } else if (contentRelY >= extrasTop + 124.0f * uiScale &&
+                                           contentRelY < extrasTop + 176.0f * uiScale) {
+                                    mSettings.modSkipCutscenes = !mSettings.modSkipCutscenes;
+                                    applySkipCutscenes(mSettings.modSkipCutscenes);
+                                    showToast(mSettings.modSkipCutscenes
+                                        ? "Saltar cinematicas activado: manten A 1 s"
+                                        : "Saltar cinematicas desactivado");
+                                } else if (contentRelY >= extrasTop + 182.0f * uiScale &&
+                                           contentRelY < extrasTop + 234.0f * uiScale) {
+                                    if (mActiveBackend == 1) {
+                                        mSettings.modFreeCamera = false;
+                                        showToast("Camara libre: solo con OpenGL ES");
+                                    } else {
+                                        mSettings.modFreeCamera = !mSettings.modFreeCamera;
+                                        showToast(mSettings.modFreeCamera
+                                            ? "Camara libre activada"
+                                            : "Camara libre desactivada");
+                                    }
+                                } else if (contentRelY >= extrasTop + 240.0f * uiScale &&
+                                           contentRelY < extrasTop + 292.0f * uiScale) {
+                                    mSettings.modLuigi = !mSettings.modLuigi;
+                                    showToast(mSettings.modLuigi
+                                        ? "Luigi activado: se aplica al entrar a la siguiente fase"
+                                        : "Mario: se aplica al entrar a la siguiente fase");
+                                } else if (contentRelY >= extrasTop + 298.0f * uiScale &&
+                                           contentRelY < extrasTop + 350.0f * uiScale) {
+                                    mSettings.adaptiveQuality = !mSettings.adaptiveQuality;
+                                    showToast(mSettings.adaptiveQuality
+                                        ? "Calidad adaptativa activada"
+                                        : "Calidad adaptativa desactivada");
+                                } else if (contentRelY >= extrasTop + 356.0f * uiScale &&
+                                           contentRelY < extrasTop + 410.0f * uiScale) {
+                                    const float rightEdge = drawerX + drawerW - padX;
+                                    const float btnW = 52.0f * uiScale;
+                                    int fov = mSettings.fovOffset;
+                                    if (px >= rightEdge - btnW) fov += 5;                    // [+]
+                                    else if (px >= rightEdge - btnW * 2.0f - 8.0f * uiScale) fov -= 5;  // [-]
+                                    else fov = 0;                                              // tap the label: reset
+                                    mSettings.fovOffset = std::max(-20, std::min(40, fov));
+                                    LOGI("settings: FOV offset set to %+d degrees (menus: image zoom, gameplay: game camera)", mSettings.fovOffset);
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    char msg[64];
+                                    snprintf(msg, sizeof(msg), mSettings.fovOffset == 0 ? "FOV normal" : "FOV %+d grados",
+                                             mSettings.fovOffset);
+                                    showToast(msg);
+                                } else if (contentRelY >= extrasTop + 442.0f * uiScale &&
+                                           contentRelY < extrasTop + 504.0f * uiScale) {
+                                    const int idx = std::max(0, std::min(3,
+                                        (int)((px - (drawerX + padX)) / (contentW / 4.0f))));
+                                    mSettings.diffEnemyDamage = idx + 1;
+                                    LOGI("settings: difficulty enemy damage set to x%d", mSettings.diffEnemyDamage);
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    char msg[64];
+                                    snprintf(msg, sizeof(msg), "Dano de enemigos x%d", mSettings.diffEnemyDamage);
+                                    showToast(msg);
+                                } else if (contentRelY >= extrasTop + 510.0f * uiScale &&
+                                           contentRelY < extrasTop + 572.0f * uiScale) {
+                                    const int idx = std::max(0, std::min(3,
+                                        (int)((px - (drawerX + padX)) / (contentW / 4.0f))));
+                                    mSettings.diffBossDamage = idx + 1;
+                                    LOGI("settings: difficulty boss damage set to x%d", mSettings.diffBossDamage);
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    char msg[64];
+                                    snprintf(msg, sizeof(msg), "Dano de jefes x%d", mSettings.diffBossDamage);
+                                    showToast(msg);
+                                } else if (contentRelY >= extrasTop + 578.0f * uiScale &&
+                                           contentRelY < extrasTop + 630.0f * uiScale) {
+                                    mSettings.diffOneHit = !mSettings.diffOneHit;
+                                    LOGI("settings: difficulty one-hit KO %s", mSettings.diffOneHit ? "on" : "off");
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    showToast(mSettings.diffOneHit ? "Un golpe y caes: activado" : "Un golpe y caes: desactivado");
+                                } else if (contentRelY >= extrasTop + 636.0f * uiScale &&
+                                           contentRelY < extrasTop + 688.0f * uiScale) {
+                                    mSettings.diffNoHeal = !mSettings.diffNoHeal;
+                                    LOGI("settings: difficulty no healing %s", mSettings.diffNoHeal ? "on" : "off");
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    showToast(mSettings.diffNoHeal ? "Sin curacion: activado" : "Sin curacion: desactivado");
+                                } else if (contentRelY >= extrasTop + 694.0f * uiScale &&
+                                           contentRelY < extrasTop + 746.0f * uiScale) {
+                                    mSettings.diffMaxHealth3 = !mSettings.diffMaxHealth3;
+                                    LOGI("settings: difficulty max health 3 %s", mSettings.diffMaxHealth3 ? "on" : "off");
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    showToast(mSettings.diffMaxHealth3 ? "Salud maxima 3: activado" : "Salud maxima 3: desactivado");
+                                } else if (contentRelY >= extrasTop + 816.0f * uiScale &&
+                                           contentRelY < extrasTop + 868.0f * uiScale) {
+                                    mSettings.randoEnabled = !mSettings.randoEnabled;
+                                    LOGI("settings: randomizer %s (seed %06d)", mSettings.randoEnabled ? "on" : "off", mSettings.randoSeed);
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    showToast(mSettings.randoEnabled ? "Randomizer activado: se aplica al cambiar de escena"
+                                                                     : "Randomizer desactivado: todo vuelve a la normalidad");
+                                } else if (contentRelY >= extrasTop + 874.0f * uiScale &&
+                                           contentRelY < extrasTop + 966.0f * uiScale) {
+                                    // Six digit boxes: top half adds one, bottom half subtracts one.
+                                    const int digit = std::max(0, std::min(5,
+                                        (int)((px - (drawerX + padX)) / (contentW / 6.0f))));
+                                    const bool upperHalf = contentRelY < extrasTop + 920.0f * uiScale;
+                                    int scale10 = 1;
+                                    for (int i = 0; i < 5 - digit; i++) scale10 *= 10;
+                                    const int cur = (mSettings.randoSeed / scale10) % 10;
+                                    const int next = (cur + (upperHalf ? 1 : 9)) % 10;
+                                    mSettings.randoSeed = std::max(0, std::min(999999, mSettings.randoSeed + (next - cur) * scale10));
+                                    LOGI("settings: randomizer seed set to %06d", mSettings.randoSeed);
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                } else if (contentRelY >= extrasTop + 972.0f * uiScale &&
+                                           contentRelY < extrasTop + 1020.0f * uiScale) {
+                                    if (px < drawerX + padX + contentW * 0.5f) {
+                                        const int64_t t = currentTimeMs();
+                                        const uint32_t mixed = (uint32_t)(t ^ (t >> 7)) * 2654435761u;
+                                        mSettings.randoSeed = (int)(mixed % 1000000u);
+                                        LOGI("settings: randomizer random seed %06d", mSettings.randoSeed);
+                                        if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                        char msg[64];
+                                        snprintf(msg, sizeof(msg), "Semilla nueva: %06d", mSettings.randoSeed);
+                                        showToast(msg);
+                                    } else {
+                                        char seedText[16];
+                                        snprintf(seedText, sizeof(seedText), "%06d", mSettings.randoSeed);
+                                        const int copied = port_android_copy_to_clipboard(seedText, (int)strlen(seedText));
+                                        LOGI("settings: randomizer seed %s copied=%d", seedText, copied);
+                                        showToast(copied ? "Semilla copiada" : "No se pudo copiar la semilla");
+                                    }
+                                } else if (contentRelY >= extrasTop + 1026.0f * uiScale &&
+                                           contentRelY < extrasTop + 1078.0f * uiScale) {
+                                    mSettings.randoGalaxies = !mSettings.randoGalaxies;
+                                    LOGI("settings: randomizer galaxies %s", mSettings.randoGalaxies ? "on" : "off");
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    showToast(mSettings.randoGalaxies ? "Galaxias mezcladas: activado" : "Galaxias mezcladas: desactivado");
+                                } else if (contentRelY >= extrasTop + 1084.0f * uiScale &&
+                                           contentRelY < extrasTop + 1136.0f * uiScale) {
+                                    mSettings.randoStars = !mSettings.randoStars;
+                                    LOGI("settings: randomizer missions %s", mSettings.randoStars ? "on" : "off");
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    showToast(mSettings.randoStars ? "Estrellas mezcladas: activado" : "Estrellas mezcladas: desactivado");
+                                } else if (contentRelY >= extrasTop + 1142.0f * uiScale &&
+                                           contentRelY < extrasTop + 1194.0f * uiScale) {
+                                    mSettings.randoEnemies = !mSettings.randoEnemies;
+                                    LOGI("settings: randomizer enemies %s", mSettings.randoEnemies ? "on" : "off");
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    showToast(mSettings.randoEnemies ? "Enemigos mezclados: activado" : "Enemigos mezclados: desactivado");
+                                } else if (contentRelY >= extrasTop + 1200.0f * uiScale &&
+                                           contentRelY < extrasTop + 1252.0f * uiScale) {
+                                    mSettings.randoItems = !mSettings.randoItems;
+                                    LOGI("settings: randomizer items %s", mSettings.randoItems ? "on" : "off");
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    showToast(mSettings.randoItems ? "Items mezclados: activado" : "Items mezclados: desactivado");
+                                } else if (contentRelY >= extrasTop + 1258.0f * uiScale &&
+                                           contentRelY < extrasTop + 1310.0f * uiScale) {
+                                    mSettings.randoPowerUps = !mSettings.randoPowerUps;
+                                    LOGI("settings: randomizer power-ups %s", mSettings.randoPowerUps ? "on" : "off");
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    showToast(mSettings.randoPowerUps ? "Power-ups mezclados: activado (puede atascarte)"
+                                                                      : "Power-ups mezclados: desactivado");
+                                } else if (contentRelY >= extrasTop + 1316.0f * uiScale &&
+                                           contentRelY < extrasTop + 1368.0f * uiScale) {
+                                    mSettings.randoChallenge = !mSettings.randoChallenge;
+                                    LOGI("settings: randomizer challenge mode %s", mSettings.randoChallenge ? "on" : "off");
+                                    if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                    showToast(mSettings.randoChallenge ? "Modo desafio: activado (juego completable)"
+                                                                       : "Modo desafio: desactivado");
+                                }
+                            }
                         }
                     } else if (mSettingsTab == 3) {
                         const float midX = drawerX + padX + contentW * 0.5f;
@@ -1960,8 +2537,14 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
                             else mSettings.showDpad = !mSettings.showDpad;
                             showToast("Visibilidad del control actualizada");
                         } else if (contentRelY >= 260.0f * uiScale && contentRelY < 312.0f * uiScale) {
-                            mSettings.showPauseButton = !mSettings.showPauseButton;
-                            showToast(mSettings.showPauseButton ? "Boton de pausa visible" : "Boton de pausa oculto");
+                            if (px < midX) {
+                                mSettings.showPauseButton = !mSettings.showPauseButton;
+                                showToast(mSettings.showPauseButton ? "Boton de pausa visible" : "Boton de pausa oculto");
+                            } else {
+                                mSettings.showCamReset = !mSettings.showCamReset;
+                                if (!mSavePath.empty()) mSettings.save(mSavePath);
+                                showToast(mSettings.showCamReset ? "Boton RESET de camara visible" : "Boton RESET de camara oculto");
+                            }
                         } else if (contentRelY >= 314.0f * uiScale && contentRelY < 368.0f * uiScale) {
                             const int idx = std::max(0, std::min(2,
                                 (int)((px - (drawerX + padX)) / (contentW / 3.0f))));
@@ -2043,14 +2626,64 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
                             if (!mSavePath.empty()) mSettings.save(mSavePath);
                             mDirty = true;
                             showToast("Inversion de camara guardada");
+                        } else if (contentRelY >= 952.0f * uiScale && contentRelY < 1004.0f * uiScale) {
+                            mSettings.showCamStick = !mSettings.showCamStick;
+                            showToast(mSettings.showCamStick ? "Joystick de camara visible" : "Joystick de camara oculto");
+                        } else if (contentRelY >= 1006.0f * uiScale && contentRelY < 1060.0f * uiScale) {
+                            const int idx = std::max(0, std::min(2,
+                                (int)((px - (drawerX + padX)) / (contentW / 3.0f))));
+                            mSettings.camStickScale = idx == 0 ? 0.8f : idx == 1 ? 1.0f : 1.25f;
+                            showToast("Tamano del joystick de camara actualizado");
+                        } else if (contentRelY >= 1062.0f * uiScale && contentRelY < 1116.0f * uiScale) {
+                            const int idx = std::max(0, std::min(3,
+                                (int)((px - (drawerX + padX)) / (contentW / 4.0f))));
+                            mSettings.camStickOpacity = idx == 0 ? 0.25f : idx == 1 ? 0.50f : idx == 2 ? 0.75f : 1.0f;
+                            showToast("Opacidad del joystick de camara actualizada");
+                        } else if (contentRelY >= 1118.0f * uiScale && contentRelY < 1170.0f * uiScale) {
+                            mSettings.gyroCamera = !mSettings.gyroCamera;
+                            showToast(mSettings.gyroCamera ? "Camara con movimiento del celular activada"
+                                                           : "Camara con movimiento del celular desactivada");
+                        } else if (contentRelY >= 1172.0f * uiScale && contentRelY < 1226.0f * uiScale) {
+                            const int idx = std::max(0, std::min(2,
+                                (int)((px - (drawerX + padX)) / (contentW / 3.0f))));
+                            mSettings.gyroCameraSens = idx == 0 ? 0.6f : idx == 1 ? 1.0f : 1.6f;
+                            showToast("Sensibilidad del movimiento actualizada");
+                        } else if (contentRelY >= 1230.0f * uiScale && contentRelY < 1290.0f * uiScale) {
+                            const float halfW2 = contentW * 0.5f;
+                            const float xIn = px < midX ? px - (drawerX + padX) : px - midX;
+                            const int idx = std::max(0, std::min(4, (int)(xIn / (halfW2 / 5.0f))));
+                            const float v5[5] = {0.50f, 0.75f, 1.00f, 1.50f, 2.00f};
+                            if (px < midX) mSettings.leftStickSensitivity = v5[idx];
+                            else mSettings.camStickSensitivity = v5[idx];
+                            if (!mSavePath.empty()) mSettings.save(mSavePath);
+                            showToast(px < midX ? "Sensibilidad del joystick de movimiento actualizada"
+                                                : "Sensibilidad del joystick de camara actualizada");
+                        } else if (contentRelY >= 1296.0f * uiScale && contentRelY < 1348.0f * uiScale) {
+                            mSettings.showCamReset = !mSettings.showCamReset;
+                            if (!mSavePath.empty()) mSettings.save(mSavePath);
+                            showToast(mSettings.showCamReset ? "Boton RESET de camara visible" : "Boton RESET de camara oculto");
+                        } else if (contentRelY >= 1350.0f * uiScale && contentRelY < 1404.0f * uiScale) {
+                            const int idx = std::max(0, std::min(2,
+                                (int)((px - (drawerX + padX)) / (contentW / 3.0f))));
+                            mSettings.camResetScale = idx == 0 ? 0.8f : idx == 1 ? 1.0f : 1.25f;
+                            if (!mSavePath.empty()) mSettings.save(mSavePath);
+                            showToast("Tamano del boton RESET actualizado");
+                        } else if (contentRelY >= 1406.0f * uiScale && contentRelY < 1460.0f * uiScale) {
+                            const int idx = std::max(0, std::min(3,
+                                (int)((px - (drawerX + padX)) / (contentW / 4.0f))));
+                            mSettings.camResetOpacity = idx == 0 ? 0.25f : idx == 1 ? 0.50f : idx == 2 ? 0.75f : 1.0f;
+                            if (!mSavePath.empty()) mSettings.save(mSavePath);
+                            showToast("Opacidad del boton RESET actualizada");
                         }
                     } else if (mSettingsTab == 4) {
-                        if (contentRelY >= 408.0f * uiScale &&
-                            contentRelY < 474.0f * uiScale) {
+                        if (contentRelY >= 268.0f * uiScale &&
+                            contentRelY < 334.0f * uiScale) {
                             mSettings.achievementNotifications =
                                 !mSettings.achievementNotifications;
                             if (!mSettings.achievementNotifications) {
-                                mAchievementToastUntilMs = 0;
+                                std::lock_guard<std::mutex> toastLock(mAchToastLock);
+                                mAchToastQueue.clear();
+                                mAchToastActive = false;
                             }
                             if (!mSavePath.empty()) mSettings.save(mSavePath);
                             LOGI("achievements: unlock notifications %s",
@@ -2059,10 +2692,36 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
                                           ? "Avisos de logros activados"
                                           : "Avisos de logros desactivados");
                             mDirty = true;
-                        } else if (contentRelY >= 480.0f * uiScale &&
-                                   contentRelY < 550.0f * uiScale) {
+                        } else if (contentRelY >= 340.0f * uiScale &&
+                                   contentRelY < 404.0f * uiScale) {
+                            mAchResetIndex = -1;
                             mAchievementClearConfirm = true;
                             mDirty = true;
+                        } else if (contentRelY >= 412.0f * uiScale &&
+                                   contentRelY < 468.0f * uiScale) {
+                            const int idx = std::max(0, std::min(2,
+                                (int)((px - (drawerX + padX)) / (contentW / 3.0f))));
+                            if (idx != mAchFilter) {
+                                mAchFilter = idx;
+                                mDrawerScrollY = std::min(mDrawerScrollY, 400.0f * uiScale);
+                                LOGI("achievements: list filter set to %s",
+                                     idx == 0 ? "all" : idx == 1 ? "locked" : "unlocked");
+                            }
+                            mDirty = true;
+                        } else if (contentRelY >= kAchListTop * uiScale) {
+                            const std::vector<int> list = achievementFilteredList();
+                            const int row = (int)((contentRelY / uiScale - kAchListTop) / kAchItemH);
+                            if (row >= 0 && (size_t)row < list.size() &&
+                                px >= drawerX + drawerW - padX - 104.0f * uiScale) {
+                                const int index = list[(size_t)row];
+                                const achv::Progress prog = mAch.progress((size_t)index, achievementPlaySeconds(),
+                                                                          mAchievementFirstGameStarted);
+                                if (prog.unlocked || prog.current > 0) {
+                                    mAchResetIndex = index;
+                                    mAchievementClearConfirm = true;
+                                    mDirty = true;
+                                }
+                            }
                         }
                     } else {
                         // Save tab rows share their drawing coordinates, including scroll offset.
@@ -2132,6 +2791,7 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
             // Outside drawer tap (scrim) closes settings
             if (px > drawerX + drawerW) {
                 mSettingsOpen = false;
+                LOGI("ui: settings drawer closed by tapping outside (tab %d)", mSettingsTab);
                 mOverwriteConfirmSlot = 0;
                 mOverwriteConfirmUntilMs = 0;
                 if (!mSavePath.empty()) mSettings.save(mSavePath);
@@ -2146,6 +2806,7 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
             float dy = py - closeBtnY;
             if (dx * dx + dy * dy <= 26.0f * uiScale * 26.0f * uiScale) {
                 mSettingsOpen = false;
+                LOGI("ui: settings drawer closed with [X] (tab %d)", mSettingsTab);
                 mOverwriteConfirmSlot = 0;
                 mOverwriteConfirmUntilMs = 0;
                 if (!mSavePath.empty()) mSettings.save(mSavePath);
@@ -2153,24 +2814,20 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
                 return true;
             }
 
-            // Keep the same content indexes in both editions; only the tab order differs.
+            // Keep the same settings tabs in both editions.
             if (py >= 58.0f * uiScale && py <= 104.0f * uiScale) {
-                const int visibleTabCount = mPlusEdition ? 5 : 4;
+                const int visibleTabCount = 5;
                 float segW = contentW / (float)visibleTabCount;
                 int visibleIndex = (int)((px - (drawerX + padX)) / segW);
                 visibleIndex = std::max(0, std::min(visibleTabCount - 1, visibleIndex));
                 int newTab = visibleIndex;
-                if (mPlusEdition) {
-                    // General, Mods, Controls, Saves, Achievements -> 0, 1, 3, 2, 4.
-                    if (visibleIndex == 2) newTab = 3;
-                    else if (visibleIndex == 3) newTab = 2;
-                } else {
-                    // General, Controls, Saves, Achievements -> 0, 3, 2, 4.
-                    if (visibleIndex == 1) newTab = 3;
-                    else if (visibleIndex == 2) newTab = 2;
-                    else if (visibleIndex == 3) newTab = 4;
-                }
+                // General, Mods, Controls, Saves, Achievements -> 0, 1, 3, 2, 4.
+                if (visibleIndex == 2) newTab = 3;
+                else if (visibleIndex == 3) newTab = 2;
                 if (newTab != mSettingsTab) {
+                    static const char* const kTabNames[5] = {"General", "Mods", "Saves", "Controls", "Achievements"};
+                    LOGI("ui: settings tab %s -> %s", kTabNames[std::max(0, std::min(4, mSettingsTab))],
+                         kTabNames[std::max(0, std::min(4, newTab))]);
                     mSettingsTab = newTab;
                     mOverwriteConfirmSlot = 0;
                     mOverwriteConfirmUntilMs = 0;
@@ -2184,6 +2841,7 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
             // Fixed [ Done ] button at bottom
             if (py >= contentBottom) {
                 mSettingsOpen = false;
+                LOGI("ui: settings drawer closed with [Done] (tab %d)", mSettingsTab);
                 mOverwriteConfirmSlot = 0;
                 mOverwriteConfirmUntilMs = 0;
                 if (!mSavePath.empty()) mSettings.save(mSavePath);
@@ -2245,6 +2903,12 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
     float stickBaseR = 95.0f * scale;
     float stickMaxR = 100.0f * scale;
 
+    // Camera (second) joystick
+    float camCx = 0.0f, camCy = 0.0f, camR = 0.0f;
+    camStickGeometry(screenW, screenH, camCx, camCy, camR);
+    float camRx = 0.0f, camRy = 0.0f, camRr = 0.0f;
+    camResetGeometry(screenW, screenH, camRx, camRy, camRr);
+
     // 1. Complete release: when all fingers are lifted or gesture canceled
     if (action == AMOTION_EVENT_ACTION_UP || action == AMOTION_EVENT_ACTION_CANCEL) {
         for (int i = 0; i < 10; i++) {
@@ -2255,6 +2919,9 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
         mStickKnobY = mStickBaseY;
         mTouchStickX = 0.0f;
         mTouchStickY = 0.0f;
+        mCamStickPointerId = -1;
+        mCamStickX = 0.0f;
+        mCamStickY = 0.0f;
         pad.stickX = 0.0f;
         pad.stickY = 0.0f;
         touchButtons = 0;
@@ -2303,6 +2970,11 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
                     mTouchStickY = 0.0f;
                     pad.stickX = 0.0f;
                     pad.stickY = 0.0f;
+                }
+                if (mTouches[i].role == TouchRole::CAM_STICK) {
+                    mCamStickPointerId = -1;
+                    mCamStickX = 0.0f;
+                    mCamStickY = 0.0f;
                 }
                 mTouches[i] = {};
             }
@@ -2375,6 +3047,26 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
                 mTouches[slot].role = TouchRole::DPAD;
                 mDirty = true;
             }
+            // Reset-camera button (next to the camera joystick)
+            else if (mSettings.showControls && !mGamepadConnected && mSettings.showCamReset &&
+                     ((px - camRx) * (px - camRx) + (py - camRy) * (py - camRy) <= (camRr * 1.25f) * (camRr * 1.25f))) {
+                mTouches[slot].role = TouchRole::CAM_RESET;
+                mCamResetFlashUntilMs = currentTimeMs() + 350;
+                port_mobile_request_camera_reset();
+                showToast("Camara reiniciada");
+                LOGI("camera: reset requested from the on-screen button");
+                mDirty = true;
+            }
+            // Camera joystick (second stick)
+            else if (mSettings.showControls && !mGamepadConnected && mSettings.showCamStick &&
+                     mCamStickPointerId < 0 &&
+                     ((px - camCx) * (px - camCx) + (py - camCy) * (py - camCy) <= (camR * 1.25f) * (camR * 1.25f))) {
+                mTouches[slot].role = TouchRole::CAM_STICK;
+                mCamStickPointerId = pid;
+                mCamStickKnobX = px;
+                mCamStickKnobY = py;
+                mDirty = true;
+            }
             // Action Buttons - NEAREST EXCLUSIVE MATCHING
             else if (mSettings.showControls && !mGamepadConnected) {
                 struct BtnCandidate {
@@ -2442,6 +3134,7 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
     mBtnDpadUp = false;
     mBtnDpadDown = false;
     bool stickFound = false;
+    bool camStickFound = false;
 
     for (size_t i = 0; i < pointerCount; i++) {
         if (action == AMOTION_EVENT_ACTION_POINTER_UP && (int32_t)i == pointerIndex) {
@@ -2491,6 +3184,44 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
             mTouchStickY = std::max(-1.0f, std::min(1.0f, mTouchStickY * sensitivity));
             pad.stickX = mTouchStickX;
             pad.stickY = mTouchStickY;
+        }
+        else if (role == TouchRole::CAM_STICK) {
+            camStickFound = true;
+            float dx = px - camCx;
+            float dy = py - camCy;
+            const float dist = sqrtf(dx * dx + dy * dy);
+            const float travel = camR * 0.80f;        // full deflection
+            const float dead = camR * 0.12f;
+            float nx = 0.0f, ny = 0.0f;
+            if (dist > travel && dist > 0.001f) {
+                mCamStickKnobX = camCx + (dx / dist) * travel;
+                mCamStickKnobY = camCy + (dy / dist) * travel;
+                nx = dx / dist;
+                ny = -dy / dist;
+            } else if (dist > dead) {
+                mCamStickKnobX = px;
+                mCamStickKnobY = py;
+                const float norm = (dist - dead) / (travel - dead);
+                nx = (dx / dist) * norm;
+                ny = -(dy / dist) * norm;
+            } else {
+                mCamStickKnobX = px;
+                mCamStickKnobY = py;
+            }
+            // Precision: shape the deflection by its length (finer control near the
+            // centre, full speed at the rim), apply the gain to the length and limit
+            // the length, not each axis, so the direction is never bent by the gain.
+            const float camGain = std::max(0.5f, std::min(2.0f, mSettings.camStickSensitivity));
+            const float m = sqrtf(nx * nx + ny * ny);
+            if (m > 0.0001f) {
+                const float shaped = std::min(1.0f, powf(std::min(1.0f, m), 1.35f) * camGain);
+                mCamStickX = nx / m * shaped;
+                mCamStickY = ny / m * shaped;
+            } else {
+                mCamStickX = 0.0f;
+                mCamStickY = 0.0f;
+            }
+            mDirty = true;
         }
         else if (role == TouchRole::DPAD) {
             float dDpadX = px - dpadX;
@@ -2565,6 +3296,13 @@ bool UIOverlay::handleInput(const AInputEvent* event, PortPadState& pad, int& sp
                 }
             }
         }
+    }
+
+    if (!camStickFound && mCamStickPointerId >= 0) {
+        mCamStickPointerId = -1;
+        mCamStickX = 0.0f;
+        mCamStickY = 0.0f;
+        mDirty = true;
     }
 
     if (!stickFound) {
@@ -2855,6 +3593,50 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
         }
 
         // ---------------------------------------------------------
+        // 1b. Camera joystick (second stick): fixed position, own size and opacity
+        // ---------------------------------------------------------
+        if (mSettings.showCamStick) {
+            float cx = 0.0f, cy = 0.0f, cr = 0.0f;
+            camStickGeometry(screenW, screenH, cx, cy, cr);
+            const float camOp = mSettings.camStickOpacity * (1.0f - mDrawerAnim * 0.75f);
+            const bool camActive = (mCamStickPointerId >= 0);
+            const float kx = camActive ? mCamStickKnobX : cx;
+            const float ky = camActive ? mCamStickKnobY : cy;
+            const float knobR = cr * 0.40f;
+
+            drawCircle(cx, cy, cr, rgba(0.05f, 0.07f, 0.11f, camOp * 0.30f));
+            drawRing(cx, cy, cr, 0.96f, rgba(0.72f, 0.62f, 1.0f, camOp * 0.50f));
+            const float tIn = cr * 0.82f, tOut = cr * 0.94f, tW = 1.6f * scale;
+            const Color tc = rgba(0.82f, 0.76f, 1.0f, camOp * 0.50f);
+            drawLine(cx, cy - tOut, cx, cy - tIn, tW, tc);
+            drawLine(cx, cy + tIn, cx, cy + tOut, tW, tc);
+            drawLine(cx - tOut, cy, cx - tIn, cy, tW, tc);
+            drawLine(cx + tIn, cy, cx + tOut, cy, tW, tc);
+            drawText("CAM", cx, cy - cr * 0.50f, 0.22f * scale, rgba(0.85f, 0.80f, 1.0f, camOp * 0.70f), 1);
+            if (camActive) {
+                drawLine(cx, cy, kx, ky, 2.4f * scale, rgba(0.72f, 0.62f, 1.0f, camOp * 0.75f));
+            }
+            drawCircle(kx, ky, camActive ? knobR * 1.05f : knobR, rgba(0.12f, 0.10f, 0.24f, camOp * (camActive ? 0.88f : 0.68f)));
+            drawRing(kx, ky, camActive ? knobR * 1.05f : knobR, 0.90f,
+                     camActive ? rgba(0.80f, 0.70f, 1.0f, camOp * 0.98f) : rgba(0.72f, 0.62f, 1.0f, camOp * 0.70f));
+            drawCircle(kx, ky, 2.6f * scale, rgba(1.0f, 1.0f, 1.0f, camOp * 0.65f));
+        }
+
+        // Reset-camera button: own visibility, size, opacity and position
+        if (mSettings.showCamReset) {
+            float rbx = 0.0f, rby = 0.0f, rbr = 0.0f;
+            camResetGeometry(screenW, screenH, rbx, rby, rbr);
+            const float rstOp = mSettings.camResetOpacity * (1.0f - mDrawerAnim * 0.75f);
+            const bool flash = currentTimeMs() < mCamResetFlashUntilMs;
+            drawCircle(rbx, rby, flash ? rbr * 0.94f : rbr, rgba(0.05f, 0.07f, 0.11f, rstOp * (flash ? 0.85f : 0.34f)));
+            drawRing(rbx, rby, flash ? rbr * 0.94f : rbr, 0.92f,
+                     flash ? rgba(0.92f, 0.86f, 1.0f, rstOp) : rgba(0.72f, 0.62f, 1.0f, rstOp * 0.62f));
+            drawText("RESET", rbx, rby + 4.0f * scale, 0.17f * scale * mSettings.camResetScale,
+                     rgba(0.88f, 0.84f, 1.0f, rstOp * (flash ? 1.0f : 0.78f)), 1);
+            if (flash) mDirty = true;
+        }
+
+        // ---------------------------------------------------------
         // 2. Action Buttons - Frosted Glass with Signature Micro-Accents
         // ---------------------------------------------------------
         float btnBaseX = w - 150.0f * scale + mSettings.buttonOffsetX;
@@ -2971,12 +3753,20 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
     // Realtime Hardware Monitor HUD (FPS, Frame Time, CPU, GPU, RAM)
     // -------------------------------------------------------------
     if (mSettings.perfHudMode > 0 && !mEditLayoutMode) {
-        char hudBuf[144];
+        char hudBuf[176];
+        // Game FPS = new frames the game produced. When the screen is refreshed
+        // faster than that (high-refresh repeats), show the screen rate too so
+        // the two are never confused.
+        const float shownGameFps = mGameFps > 1.0f ? mGameFps : mCurrentFps;
+        char screenBuf[32] = "";
+        if (mCurrentFps > shownGameFps + 3.0f) {
+            snprintf(screenBuf, sizeof(screenBuf), "  •  Pantalla %.0f", mCurrentFps);
+        }
         if (mSettings.perfHudMode == 1) {
-            snprintf(hudBuf, sizeof(hudBuf), "%.1f FPS  •  %.1f ms", mCurrentFps, mAvgFrameTimeMs);
+            snprintf(hudBuf, sizeof(hudBuf), "%.1f FPS  •  %.1f ms%s", shownGameFps, mAvgFrameTimeMs, screenBuf);
         } else {
-            snprintf(hudBuf, sizeof(hudBuf), "%.1f FPS  •  %.1f ms  •  CPU %.0f%%  •  GPU %.0f%%  •  RAM %.0f MB",
-                     mCurrentFps, mAvgFrameTimeMs, mCpuUsagePercent, mGpuUsagePercent, mRamUsageMB);
+            snprintf(hudBuf, sizeof(hudBuf), "%.1f FPS  •  %.1f ms%s  •  CPU %.0f%%  •  GPU %.0f%%  •  RAM %.0f MB",
+                     shownGameFps, mAvgFrameTimeMs, screenBuf, mCpuUsagePercent, mGpuUsagePercent, mRamUsageMB);
         }
 
         float hudTextScale = 0.28f * uiScale;
@@ -2993,13 +3783,43 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
         drawRoundRect(hudX + 1.0f, hudY + 1.0f, hudX + hudW - 1.0f, hudY + hudH - 1.0f, 12.0f * uiScale, rgba(0.24f, 0.32f, 0.44f, 0.55f));
 
         // Pulsing status LED
-        Color ledColor = (mCurrentFps >= 55.0f) ? rgba(0.30f, 0.90f, 0.50f, 1.0f) :
-                         (mCurrentFps >= 30.0f) ? rgba(1.0f, 0.75f, 0.20f, 1.0f) :
+        Color ledColor = (shownGameFps >= 55.0f) ? rgba(0.30f, 0.90f, 0.50f, 1.0f) :
+                         (shownGameFps >= 30.0f) ? rgba(1.0f, 0.75f, 0.20f, 1.0f) :
                                                   rgba(0.95f, 0.30f, 0.25f, 1.0f);
         drawCircle(hudX + 10.0f * uiScale, hudY + hudH * 0.5f, 3.5f * uiScale, ledColor);
 
         // Render stats typography
         drawText(hudBuf, hudX + 18.0f * uiScale, hudY + hudH * 0.5f + 4.0f * uiScale, hudTextScale, rgba(0.92f, 0.95f, 1.0f, 0.95f), 0);
+    }
+
+    // -------------------------------------------------------------
+    // Skip-cutscene indicator: fills while A is held, then "skipping".
+    // -------------------------------------------------------------
+    if (mSettings.modSkipCutscenes && !mEditLayoutMode) {
+        float skipProgress = 0.0f;
+        int skipForwarding = 0;
+        unsigned skipCount = 0;
+        port_skip_indicator(&skipProgress, &skipForwarding, &skipCount);
+        if (skipProgress > 0.01f || skipForwarding) {
+            const char* label = skipForwarding ? "Saltando..." : "Manten A para saltar";
+            const float labelScale = 0.28f * uiScale;
+            const float pillW = std::max(measureText(label, labelScale) + 28.0f * uiScale, 150.0f * uiScale);
+            const float pillH = 24.0f * uiScale;
+            const float pillX = w * 0.5f - pillW * 0.5f;
+            const float pillY = 52.0f * uiScale;
+            drawRoundRect(pillX, pillY, pillX + pillW, pillY + pillH, 12.0f * uiScale,
+                          rgba(0.06f, 0.08f, 0.12f, 0.85f));
+            const float fill = skipForwarding ? 1.0f : std::max(0.0f, std::min(1.0f, skipProgress));
+            if (fill > 0.02f) {
+                drawRoundRect(pillX + 2.0f * uiScale, pillY + 2.0f * uiScale,
+                              pillX + 2.0f * uiScale + (pillW - 4.0f * uiScale) * fill,
+                              pillY + pillH - 2.0f * uiScale, 10.0f * uiScale,
+                              rgba(0.30f, 0.90f, 0.50f, 0.55f));
+            }
+            drawText(label, pillX + 14.0f * uiScale, pillY + pillH * 0.5f + 4.0f * uiScale,
+                     labelScale, rgba(0.92f, 0.95f, 1.0f, 0.95f), 0);
+            mDirty = true;  // keep animating while the hold is in progress
+        }
     }
 
     // -------------------------------------------------------------
@@ -3109,10 +3929,10 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
         float contentTop = 112.0f * uiScale;
         float contentBottom = h - 56.0f * uiScale;
         const bool showingGeneralTab = mSettingsTab == 0;
-        float totalContentH = showingGeneralTab ? (1540.0f * uiScale) :
-                              (mSettingsTab == 4 ? (560.0f * uiScale) :
-                               (mSettingsTab == 3 ? (950.0f * uiScale) :
-                               ((mPlusEdition && mSettingsTab == 1) ? (760.0f * uiScale) : (580.0f * uiScale))));
+        float totalContentH = showingGeneralTab ? ((1600.0f + kAntialiasingRowHeight) * uiScale) :
+                              (mSettingsTab == 4 ? (achievementsTabContentHeight() * uiScale) :
+                               (mSettingsTab == 3 ? (1510.0f * uiScale) :
+                                (mSettingsTab == 1 ? (modsTabContentHeight() * uiScale) : (580.0f * uiScale))));
         float maxScroll = std::max(0.0f, totalContentH - (contentBottom - contentTop));
 
         // Smooth scroll damping
@@ -3133,6 +3953,9 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
         if (mSettingsTab == 0) {
             // General Tab Settings Items
             auto renderRow = [&](float relY, float rowH, auto func) {
+                if (relY >= 950.0f * uiScale) {
+                    relY += kAntialiasingRowHeight * uiScale;
+                }
                 float drawY = contentTop + relY - mDrawerScrollY;
                 if (drawY + rowH >= contentTop - 12.0f && drawY <= contentBottom + 12.0f) {
                     func(drawY);
@@ -3262,9 +4085,8 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
             // Row 12: Target Frame Rate Segmented Button
             renderRow(664.0f * uiScale, 54.0f * uiScale, [&](float y) {
                 drawText("Target Frame Rate", drawerX + padX, y + 14.0f * uiScale, 0.38f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                const char* fpsOpts[5] = {"30", "60", "90", "120", "144"};
-                int fpsIdx = (mSettings.targetFps >= 144) ? 4 : (mSettings.targetFps >= 120) ? 3 : (mSettings.targetFps >= 90) ? 2 : (mSettings.targetFps >= 60) ? 1 : 0;
-                drawSegmentedGroup(drawerX + padX, y + 22.0f * uiScale, contentW, 34.0f * uiScale, fpsOpts, 5, fpsIdx);
+                drawText(mSettings.batterySaver ? "30 FPS (Battery Saver)" : "60 FPS (native game speed)",
+                         drawerX + padX, y + 44.0f * uiScale, 0.34f * uiScale, rgba(0.70f, 0.89f, 1.0f, 1.0f), 0);
             });
 
             // Row 13: Graphics Backend Segmented Button
@@ -3299,12 +4121,47 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
                 drawSegmentedGroup(drawerX + padX, y + 22.0f * uiScale, contentW, 34.0f * uiScale, resOpts, 5, resIdx);
             });
 
+            // Single compact FXAA selector; it is a post-process quality level,
+            // independent from the selected internal render resolution.
+            {
+                const float relY = 950.0f * uiScale;
+                const float rowH = kAntialiasingRowHeight * uiScale;
+                const float drawY = contentTop + relY - mDrawerScrollY;
+                if (drawY + rowH >= contentTop - 12.0f && drawY <= contentBottom + 12.0f) {
+                    drawText("Antialiasing (FXAA)", drawerX + padX, drawY + 15.0f * uiScale,
+                             0.37f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
+                    const float controlX0 = drawerX + padX;
+                    const float controlX1 = drawerX + drawerW - padX;
+                    const float controlY0 = drawY + 25.0f * uiScale;
+                    const float controlY1 = controlY0 + 32.0f * uiScale;
+                    const float arrowW = std::min(42.0f * uiScale, (controlX1 - controlX0) * 0.25f);
+                    drawRoundRect(controlX0, controlY0, controlX1, controlY1,
+                                  9.0f * uiScale, rgba(0.10f, 0.12f, 0.16f, 0.95f));
+                    drawRoundRect(controlX0, controlY0, controlX0 + arrowW, controlY1,
+                                  9.0f * uiScale, rgba(0.15f, 0.31f, 0.56f, 0.95f));
+                    drawRoundRect(controlX1 - arrowW, controlY0, controlX1, controlY1,
+                                  9.0f * uiScale, rgba(0.15f, 0.31f, 0.56f, 0.95f));
+                    drawText("<", controlX0 + arrowW * 0.5f, controlY0 + 23.0f * uiScale,
+                             0.68f * uiScale, rgba(0.95f, 0.97f, 1.0f, 1.0f), 1);
+                    drawText(">", controlX1 - arrowW * 0.5f, controlY0 + 23.0f * uiScale,
+                             0.68f * uiScale, rgba(0.95f, 0.97f, 1.0f, 1.0f), 1);
+                    char aaValue[24];
+                    if (mSettings.antialiasingLevel == 0) {
+                        snprintf(aaValue, sizeof(aaValue), "OFF");
+                    } else {
+                        snprintf(aaValue, sizeof(aaValue), "FXAA x%d", mSettings.antialiasingLevel);
+                    }
+                    drawText(aaValue, (controlX0 + controlX1) * 0.5f,
+                             controlY0 + 21.0f * uiScale, 0.34f * uiScale,
+                             rgba(0.70f, 0.89f, 1.0f, 1.0f), 1);
+                }
+            }
+
             // Row 16b: Display Refresh & Framerate Pacing
             renderRow(950.0f * uiScale, 54.0f * uiScale, [&](float y) {
                 drawText("Display Refresh & Target FPS", drawerX + padX, y + 14.0f * uiScale, 0.38f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                const char* fpsOpts[4] = {"60 Hz", "90 Hz", "120 Hz", "144 Hz"};
-                int fpsIdx = (mSettings.targetFps >= 144) ? 3 : (mSettings.targetFps >= 120) ? 2 : (mSettings.targetFps >= 90) ? 1 : 0;
-                drawSegmentedGroup(drawerX + padX, y + 22.0f * uiScale, contentW, 34.0f * uiScale, fpsOpts, 4, fpsIdx);
+                drawText("60 Hz (native game speed)",
+                         drawerX + padX, y + 44.0f * uiScale, 0.34f * uiScale, rgba(0.70f, 0.89f, 1.0f, 1.0f), 0);
             });
 
             // Row 17: Vibration Haptics Switch
@@ -3396,8 +4253,16 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
                 drawText(apiLine, cardX0 + 12.0f * uiScale, y + 49.0f * uiScale, 0.24f * uiScale, rgba(0.55f, 0.60f, 0.68f, 0.80f), 0);
             });
 
+            // Row 21b: log on/off
+            renderRow(1470.0f * uiScale, 54.0f * uiScale, [&](float y) {
+                drawText("Registro (log)", drawerX + padX, y + 18.0f * uiScale, 0.38f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
+                drawText(mSettings.logEnabled ? "Activado: guarda el detalle del juego" : "Apagado: solo se guardan errores graves",
+                         drawerX + padX, y + 34.0f * uiScale, 0.28f * uiScale, rgba(0.761f, 0.776f, 0.812f, 0.85f), 0);
+                drawM3Switch(drawerX + drawerW - padX - swW, y + 10.0f * uiScale, swW, swH, mSettings.logEnabled);
+            });
+
             // Row 22: Return to Setup / Launcher Button
-            renderRow(1472.0f * uiScale, 52.0f * uiScale, [&](float y) {
+            renderRow(1532.0f * uiScale, 52.0f * uiScale, [&](float y) {
                 float bX0 = drawerX + padX;
                 float bX1 = drawerX + drawerW - padX;
                 float btnY = y + 4.0f * uiScale;
@@ -3406,117 +4271,274 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
                 drawText("Exit to Setup Launcher", (bX0 + bX1) * 0.5f, btnY + 25.0f * uiScale, 0.38f * uiScale, rgba(1.0f, 0.88f, 0.88f, 1.0f), 1);
             });
         }
-        else if (mPlusEdition && mSettingsTab == 1) {
-            // Mod Manager Tab Content
+        else if (mSettingsTab == 1) {
             auto renderRow = [&](float relY, float rowH, auto func) {
-                float drawY = contentTop + relY - mDrawerScrollY;
-                if (drawY + rowH >= contentTop - 12.0f && drawY <= contentBottom + 12.0f) {
-                    func(drawY);
-                }
+                const float drawY = contentTop + relY - mDrawerScrollY;
+                if (drawY + rowH >= contentTop - 12.0f && drawY <= contentBottom + 12.0f) func(drawY);
             };
+            const auto modsSnapshot = port_mods::list();
+            const auto& mods = *modsSnapshot;
+            const float left = drawerX + padX;
+            const float right = drawerX + drawerW - padX;
 
-            // Section 1: NVIDIA SHIELD REMASTER PACK
-            renderRow(4.0f * uiScale, 36.0f * uiScale, [&](float y) {
-                drawText("NVIDIA Shield Remaster Pack", drawerX + padX, y + 16.0f * uiScale, 0.38f * uiScale, rgba(0.38f, 0.78f, 0.98f, 1.0f), 0);
-                drawText("Authentic 1080p AI assets from Shield TV port", drawerX + padX, y + 32.0f * uiScale, 0.27f * uiScale, rgba(0.68f, 0.75f, 0.88f, 0.85f), 0);
+            renderRow(4.0f * uiScale, 80.0f * uiScale, [&](float y) {
+                drawText("Mods de archivos locales", left, y + 22.0f * uiScale,
+                         0.39f * uiScale, rgba(0.38f, 0.78f, 0.98f, 1.0f), 0);
+                drawText("Reemplazan recursos existentes; se aplican al reiniciar",
+                         left, y + 43.0f * uiScale, 0.26f * uiScale,
+                         rgba(0.68f, 0.75f, 0.88f, 0.88f), 0);
+                drawM3Switch(right - swW, y + 48.0f * uiScale, swW, swH,
+                             mSettings.modRiivolution);
             });
 
-            // Mod 1: NVIDIA Shield HD Textures
-            renderRow(44.0f * uiScale, 50.0f * uiScale, [&](float y) {
-                drawText("Shield HD Textures", drawerX + padX, y + 18.0f * uiScale, 0.39f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                drawText("1080p AI Remastered UI, characters & HUD", drawerX + padX, y + 34.0f * uiScale, 0.27f * uiScale, rgba(0.761f, 0.776f, 0.812f, 0.85f), 0);
-                drawM3Switch(drawerX + drawerW - padX - swW, y + 10.0f * uiScale, swW, swH, mSettings.modShieldTextures);
+            renderRow(92.0f * uiScale, 48.0f * uiScale, [&](float y) {
+                const float gap = 5.0f * uiScale;
+                const float cell = contentW / 3.0f;
+                const float buttonY = y + 3.0f * uiScale;
+                drawRoundRect(left, buttonY, left + cell - gap, buttonY + 38.0f * uiScale,
+                              12.0f * uiScale, rgba(0.14f, 0.34f, 0.53f, 0.95f));
+                drawRoundRect(left + cell, buttonY, left + cell * 2.0f - gap, buttonY + 38.0f * uiScale,
+                              12.0f * uiScale, rgba(0.20f, 0.25f, 0.34f, 0.95f));
+                drawRoundRect(left + cell * 2.0f, buttonY, right, buttonY + 38.0f * uiScale,
+                              12.0f * uiScale, rgba(0.20f, 0.25f, 0.34f, 0.95f));
+                drawText("IMPORTAR ZIP", left + cell * 0.5f - gap * 0.5f, buttonY + 24.0f * uiScale,
+                         0.23f * uiScale, rgba(0.90f, 0.95f, 1.0f, 1.0f), 1);
+                drawText("ESCANEAR", left + cell * 1.5f - gap * 0.5f, buttonY + 24.0f * uiScale,
+                         0.25f * uiScale, rgba(0.90f, 0.95f, 1.0f, 1.0f), 1);
+                drawText("RUTA", left + cell * 2.5f, buttonY + 24.0f * uiScale,
+                         0.25f * uiScale, rgba(0.90f, 0.92f, 0.97f, 1.0f), 1);
             });
 
-            // Mod 2: NVIDIA Shield 60FPS Cutscenes
-            renderRow(96.0f * uiScale, 50.0f * uiScale, [&](float y) {
-                drawText("Shield 60FPS Cutscenes", drawerX + padX, y + 18.0f * uiScale, 0.39f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                drawText("H.264 MP4 hardware video stream", drawerX + padX, y + 34.0f * uiScale, 0.27f * uiScale, rgba(0.761f, 0.776f, 0.812f, 0.85f), 0);
-                drawM3Switch(drawerX + drawerW - padX - swW, y + 10.0f * uiScale, swW, swH, mSettings.modShieldCutscenes);
+            renderRow(142.0f * uiScale, 24.0f * uiScale, [&](float y) {
+                char summary[96];
+                snprintf(summary, sizeof(summary), "PAQUETES DETECTADOS: %zu", mods.size());
+                drawText(summary, left, y + 17.0f * uiScale, 0.27f * uiScale,
+                         rgba(0.55f, 0.86f, 0.75f, 1.0f), 0);
+                drawText("GalaxyData/mods", right, y + 17.0f * uiScale, 0.24f * uiScale,
+                         rgba(0.62f, 0.66f, 0.74f, 0.80f), 2);
             });
 
-            // Mod 3: Shield Controller Curves
-            renderRow(148.0f * uiScale, 50.0f * uiScale, [&](float y) {
-                drawText("Calibrated Analog Curves", drawerX + padX, y + 18.0f * uiScale, 0.39f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                drawText("smg_controller.ini ray surfing & pointer damping", drawerX + padX, y + 34.0f * uiScale, 0.27f * uiScale, rgba(0.761f, 0.776f, 0.812f, 0.85f), 0);
-                drawM3Switch(drawerX + drawerW - padX - swW, y + 10.0f * uiScale, swW, swH, mSettings.modShieldControls);
+            if (mods.empty()) {
+                renderRow(kModsListStartY * uiScale, 100.0f * uiScale, [&](float y) {
+                    drawRoundRect(left, y, right, y + 94.0f * uiScale,
+                                  14.0f * uiScale, rgba(0.11f, 0.13f, 0.17f, 0.95f));
+                    drawRoundRect(left, y, right, y + 94.0f * uiScale,
+                                  14.0f * uiScale, rgba(0.32f, 0.36f, 0.43f, 0.48f));
+                    drawText("No hay mods compatibles", left + 12.0f * uiScale,
+                             y + 30.0f * uiScale, 0.33f * uiScale,
+                             rgba(0.92f, 0.93f, 0.96f, 1.0f), 0);
+                    drawText("Importa un ZIP con files/ y recursos compatibles.",
+                             left + 12.0f * uiScale, y + 54.0f * uiScale,
+                             0.25f * uiScale, rgba(0.68f, 0.72f, 0.80f, 0.92f), 0);
+                    drawText("Solo se sustituyen archivos del juego que ya existen.",
+                             left + 12.0f * uiScale, y + 74.0f * uiScale,
+                             0.23f * uiScale, rgba(0.55f, 0.60f, 0.68f, 0.86f), 0);
+                });
+            } else {
+                for (size_t i = 0; i < mods.size(); ++i) {
+                    const port_mods::ModInfo mod = mods[i];
+                    const float rowY = (kModsListStartY + i * kModsRowPitch) * uiScale;
+                    renderRow(rowY, kModsRowHeight * uiScale, [&](float y) {
+                        drawRoundRect(left, y, right, y + kModsRowHeight * uiScale,
+                                      13.0f * uiScale, rgba(0.11f, 0.13f, 0.17f, 0.95f));
+                        drawRoundRect(left, y, right, y + kModsRowHeight * uiScale,
+                                      13.0f * uiScale, rgba(0.32f, 0.36f, 0.43f, 0.48f));
+                        drawText(mod.name.c_str(), left + 11.0f * uiScale,
+                                 y + 24.0f * uiScale, 0.31f * uiScale,
+                                 rgba(0.92f, 0.93f, 0.96f, 1.0f), 0);
+                        char detail[96];
+                        snprintf(detail, sizeof(detail), "%s  ·  %d archivos  ·  %s",
+                                 mod.version.empty() ? mod.id.c_str() : mod.version.c_str(),
+                                 mod.replacementCount, mod.enabled ? "ACTIVADO" : "DESACTIVADO");
+                        drawText(detail, left + 11.0f * uiScale, y + 47.0f * uiScale,
+                                 0.23f * uiScale,
+                                 mod.enabled ? rgba(0.45f, 0.86f, 0.68f, 0.95f)
+                                             : rgba(0.65f, 0.68f, 0.74f, 0.88f), 0);
+                        drawM3Switch(right - swW, y + 17.0f * uiScale, swW, swH, mod.enabled);
+                    });
+                }
+            }
+
+            const float extrasTop = modsExtrasStartY() * uiScale;
+            renderRow(extrasTop, 52.0f * uiScale, [&](float y) {
+                drawText("Modo vuelo", left, y + 21.0f * uiScale, 0.33f * uiScale,
+                         rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                drawText("Activa o desactiva el modo de vuelo", left, y + 39.0f * uiScale,
+                         0.23f * uiScale, rgba(0.62f, 0.66f, 0.74f, 0.85f), 0);
+                drawM3Switch(right - swW, y + 10.0f * uiScale, swW, swH, mSettings.modFly);
             });
 
-            // Mod 4: Classic Gamepad ABXY Prompts
-            renderRow(200.0f * uiScale, 50.0f * uiScale, [&](float y) {
-                drawText("Modern Gamepad ABXY UI", drawerX + padX, y + 18.0f * uiScale, 0.39f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                drawText("Replaces Wii Remote icons with Xbox/Shield buttons", drawerX + padX, y + 34.0f * uiScale, 0.27f * uiScale, rgba(0.761f, 0.776f, 0.812f, 0.85f), 0);
-                drawM3Switch(drawerX + drawerW - padX - swW, y + 10.0f * uiScale, swW, swH, mSettings.modClassicGamepadUI);
+            renderRow(extrasTop + 58.0f * uiScale, 62.0f * uiScale, [&](float y) {
+                drawText("Velocidad del juego", left, y + 16.0f * uiScale,
+                         0.31f * uiScale, rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                const char* speedOptions[5] = {"1x", "1.5x", "2x", "3x", "4x"};
+                drawSegmentedGroup(left, y + 23.0f * uiScale, contentW,
+                                   32.0f * uiScale, speedOptions, 5,
+                                   std::max(0, std::min(4, mSettings.gameSpeed - 1)));
             });
-
-            // Section 2: GAMEPLAY & CHEAT MODS
-            renderRow(254.0f * uiScale, 36.0f * uiScale, [&](float y) {
-                drawText("Gameplay & Cheats", drawerX + padX, y + 16.0f * uiScale, 0.38f * uiScale, rgba(0.40f, 0.85f, 0.65f, 1.0f), 0);
-                drawText("Developer sandbox & flight utilities", drawerX + padX, y + 32.0f * uiScale, 0.27f * uiScale, rgba(0.68f, 0.75f, 0.88f, 0.85f), 0);
+            renderRow(extrasTop + 124.0f * uiScale, 52.0f * uiScale, [&](float y) {
+                drawText("Saltar cinematicas", left, y + 21.0f * uiScale, 0.33f * uiScale,
+                         rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                drawText("Videos al instante; manten A 1 s en escenas y dialogos", left, y + 39.0f * uiScale,
+                         0.23f * uiScale, rgba(0.62f, 0.66f, 0.74f, 0.85f), 0);
+                drawM3Switch(right - swW, y + 10.0f * uiScale, swW, swH, mSettings.modSkipCutscenes);
             });
-
-            // Mod 5: Fly Mode Switch
-            renderRow(292.0f * uiScale, 50.0f * uiScale, [&](float y) {
-                drawText("Fly Mode", drawerX + padX, y + 18.0f * uiScale, 0.39f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                drawText("Hold A to ascend, hold Z to descend", drawerX + padX, y + 34.0f * uiScale, 0.27f * uiScale, rgba(0.761f, 0.776f, 0.812f, 0.85f), 0);
-                drawM3Switch(drawerX + drawerW - padX - swW, y + 10.0f * uiScale, swW, swH, mSettings.modFly);
+            renderRow(extrasTop + 182.0f * uiScale, 52.0f * uiScale, [&](float y) {
+                drawText("Camara libre", left, y + 21.0f * uiScale, 0.33f * uiScale,
+                         rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                drawText("Stick mover, D-pad girar, A/B subir y bajar, Z rapido", left, y + 39.0f * uiScale,
+                         0.23f * uiScale, rgba(0.62f, 0.66f, 0.74f, 0.85f), 0);
+                drawM3Switch(right - swW, y + 10.0f * uiScale, swW, swH, mSettings.modFreeCamera);
             });
-
-            // Mod 6: Cutscene Prevention
-            renderRow(344.0f * uiScale, 50.0f * uiScale, [&](float y) {
-                drawText("Cutscene Prevention", drawerX + padX, y + 18.0f * uiScale, 0.39f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                drawText("Instantly skip dialogues & cinematic scenes", drawerX + padX, y + 34.0f * uiScale, 0.27f * uiScale, rgba(0.761f, 0.776f, 0.812f, 0.85f), 0);
-                drawM3Switch(drawerX + drawerW - padX - swW, y + 10.0f * uiScale, swW, swH, mSettings.modSkipCutscenes);
+            renderRow(extrasTop + 240.0f * uiScale, 52.0f * uiScale, [&](float y) {
+                drawText("Jugar como Luigi", left, y + 21.0f * uiScale, 0.33f * uiScale,
+                         rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                drawText("Se aplica al entrar a la siguiente fase", left, y + 39.0f * uiScale,
+                         0.23f * uiScale, rgba(0.62f, 0.66f, 0.74f, 0.85f), 0);
+                drawM3Switch(right - swW, y + 10.0f * uiScale, swW, swH, mSettings.modLuigi);
             });
-
-            // Mod 7: Infinite Health
-            renderRow(396.0f * uiScale, 50.0f * uiScale, [&](float y) {
-                drawText("Infinite Health", drawerX + padX, y + 18.0f * uiScale, 0.39f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                drawText("Invincible; escape black holes automatically", drawerX + padX, y + 34.0f * uiScale, 0.27f * uiScale, rgba(0.761f, 0.776f, 0.812f, 0.85f), 0);
-                drawM3Switch(drawerX + drawerW - padX - swW, y + 10.0f * uiScale, swW, swH, mSettings.modInfiniteHealth);
+            renderRow(extrasTop + 298.0f * uiScale, 52.0f * uiScale, [&](float y) {
+                drawText("Calidad adaptativa", left, y + 21.0f * uiScale, 0.33f * uiScale,
+                         rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                drawText("Baja el FXAA si los FPS caen; sube al estabilizarse", left, y + 39.0f * uiScale,
+                         0.23f * uiScale, rgba(0.62f, 0.66f, 0.74f, 0.85f), 0);
+                drawM3Switch(right - swW, y + 10.0f * uiScale, swW, swH, mSettings.adaptiveQuality);
             });
-
-            // Mod 8: Infinite Lives (99)
-            renderRow(448.0f * uiScale, 50.0f * uiScale, [&](float y) {
-                drawText("Infinite Lives (99)", drawerX + padX, y + 18.0f * uiScale, 0.39f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                drawText("Lock Mario's life counter to 99 lives", drawerX + padX, y + 34.0f * uiScale, 0.27f * uiScale, rgba(0.761f, 0.776f, 0.812f, 0.85f), 0);
-                drawM3Switch(drawerX + drawerW - padX - swW, y + 10.0f * uiScale, swW, swH, mSettings.modInfiniteLives);
+            renderRow(extrasTop + 356.0f * uiScale, 54.0f * uiScale, [&](float y) {
+                char fovLabel[48];
+                if (mSettings.fovOffset == 0) snprintf(fovLabel, sizeof(fovLabel), "FOV: normal");
+                else snprintf(fovLabel, sizeof(fovLabel), "FOV: %+d grados", mSettings.fovOffset);
+                drawText(fovLabel, left, y + 21.0f * uiScale, 0.33f * uiScale,
+                         rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                drawText("Menos = cerca (zoom); mas = lejos. Toca el texto: 0",
+                         left, y + 39.0f * uiScale, 0.21f * uiScale, rgba(0.62f, 0.66f, 0.74f, 0.85f), 0);
+                const float btnW = 52.0f * uiScale;
+                const float btnH = 38.0f * uiScale;
+                const float by0 = y + 6.0f * uiScale;
+                drawRoundRect(right - btnW * 2.0f - 8.0f * uiScale, by0, right - btnW - 8.0f * uiScale, by0 + btnH,
+                              12.0f * uiScale, rgba(0.20f, 0.25f, 0.34f, 0.95f));
+                drawRoundRect(right - btnW, by0, right, by0 + btnH, 12.0f * uiScale, rgba(0.20f, 0.25f, 0.34f, 0.95f));
+                drawText("-", right - btnW * 1.5f - 8.0f * uiScale, by0 + 27.0f * uiScale, 0.46f * uiScale,
+                         rgba(0.92f, 0.95f, 1.0f, 1.0f), 1);
+                drawText("+", right - btnW * 0.5f, by0 + 27.0f * uiScale, 0.46f * uiScale,
+                         rgba(0.92f, 0.95f, 1.0f, 1.0f), 1);
             });
-
-            // Mod 9: Infinite Star Bits (999)
-            renderRow(500.0f * uiScale, 50.0f * uiScale, [&](float y) {
-                drawText("Infinite Star Bits (999)", drawerX + padX, y + 18.0f * uiScale, 0.39f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                drawText("Max out Star Bits pouch to 999", drawerX + padX, y + 34.0f * uiScale, 0.27f * uiScale, rgba(0.761f, 0.776f, 0.812f, 0.85f), 0);
-                drawM3Switch(drawerX + drawerW - padX - swW, y + 10.0f * uiScale, swW, swH, mSettings.modInfiniteStarBits);
+            renderRow(extrasTop + 416.0f * uiScale, 22.0f * uiScale, [&](float y) {
+                drawText("DIFICULTAD", left, y + 15.0f * uiScale, 0.27f * uiScale,
+                         rgba(0.95f, 0.62f, 0.45f, 0.95f), 0);
             });
-
-            // Mod 10: Turbo Game Speed
-            renderRow(552.0f * uiScale, 54.0f * uiScale, [&](float y) {
-                drawText("Turbo Game Speed", drawerX + padX, y + 14.0f * uiScale, 0.38f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                const char* spdOpts[5] = {"1.0x", "1.5x", "2.0x", "3.0x", "4.0x"};
-                drawSegmentedGroup(drawerX + padX, y + 20.0f * uiScale, contentW, 32.0f * uiScale, spdOpts, 5, mSettings.gameSpeed - 1);
+            const char* dmgOptions[4] = {"x1", "x2", "x3", "x4"};
+            renderRow(extrasTop + 442.0f * uiScale, 62.0f * uiScale, [&](float y) {
+                drawText("Dano de enemigos", left, y + 16.0f * uiScale, 0.31f * uiScale,
+                         rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                drawSegmentedGroup(left, y + 23.0f * uiScale, contentW, 32.0f * uiScale, dmgOptions, 4,
+                                   std::max(0, std::min(3, mSettings.diffEnemyDamage - 1)));
             });
-
-            // Section 3: EXTERNAL RIIVOLUTION MODS
-            renderRow(610.0f * uiScale, 36.0f * uiScale, [&](float y) {
-                drawText("Riivolution Modding System", drawerX + padX, y + 16.0f * uiScale, 0.38f * uiScale, rgba(0.95f, 0.75f, 0.35f, 1.0f), 0);
-                drawText("Load custom XML mods from /sdcard/GalaxyData/mods", drawerX + padX, y + 32.0f * uiScale, 0.27f * uiScale, rgba(0.68f, 0.75f, 0.88f, 0.85f), 0);
+            renderRow(extrasTop + 510.0f * uiScale, 62.0f * uiScale, [&](float y) {
+                drawText("Dano de jefes (galaxias de jefe)", left, y + 16.0f * uiScale, 0.31f * uiScale,
+                         rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                drawSegmentedGroup(left, y + 23.0f * uiScale, contentW, 32.0f * uiScale, dmgOptions, 4,
+                                   std::max(0, std::min(3, mSettings.diffBossDamage - 1)));
             });
-
-            // Mod 11: Riivolution Switch
-            renderRow(648.0f * uiScale, 50.0f * uiScale, [&](float y) {
-                drawText("Enable Riivolution Mods", drawerX + padX, y + 18.0f * uiScale, 0.39f * uiScale, rgba(0.902f, 0.906f, 0.922f, 1.0f), 0);
-                drawText("Patch game files on the fly from SD card", drawerX + padX, y + 34.0f * uiScale, 0.27f * uiScale, rgba(0.761f, 0.776f, 0.812f, 0.85f), 0);
-                drawM3Switch(drawerX + drawerW - padX - swW, y + 10.0f * uiScale, swW, swH, mSettings.modRiivolution);
+            renderRow(extrasTop + 578.0f * uiScale, 52.0f * uiScale, [&](float y) {
+                drawText("Un golpe y caes", left, y + 21.0f * uiScale, 0.33f * uiScale,
+                         rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                drawText("Cualquier dano te quita toda la salud", left, y + 39.0f * uiScale,
+                         0.23f * uiScale, rgba(0.62f, 0.66f, 0.74f, 0.85f), 0);
+                drawM3Switch(right - swW, y + 10.0f * uiScale, swW, swH, mSettings.diffOneHit);
             });
-
-            // Mod 12: Scan & Reload Mods Button
-            renderRow(700.0f * uiScale, 48.0f * uiScale, [&](float y) {
-                float bX0 = drawerX + padX;
-                float bX1 = drawerX + drawerW - padX;
-                drawRoundRect(bX0, y + 4.0f * uiScale, bX1, y + 42.0f * uiScale, 14.0f * uiScale, rgba(0.18f, 0.22f, 0.30f, 0.95f));
-                drawRoundRect(bX0, y + 4.0f * uiScale, bX1, y + 42.0f * uiScale, 14.0f * uiScale, rgba(0.35f, 0.50f, 0.75f, 0.65f));
-                drawText("SCAN & RELOAD MOD DIRECTORY", (bX0 + bX1) * 0.5f, y + 26.0f * uiScale, 0.34f * uiScale, rgba(0.85f, 0.92f, 1.0f, 1.0f), 1);
+            renderRow(extrasTop + 636.0f * uiScale, 52.0f * uiScale, [&](float y) {
+                drawText("Sin curacion", left, y + 21.0f * uiScale, 0.33f * uiScale,
+                         rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                drawText("La salud solo se recupera al reaparecer o con Champinon de vida", left, y + 39.0f * uiScale,
+                         0.21f * uiScale, rgba(0.62f, 0.66f, 0.74f, 0.85f), 0);
+                drawM3Switch(right - swW, y + 10.0f * uiScale, swW, swH, mSettings.diffNoHeal);
+            });
+            renderRow(extrasTop + 694.0f * uiScale, 52.0f * uiScale, [&](float y) {
+                drawText("Salud maxima 3", left, y + 21.0f * uiScale, 0.33f * uiScale,
+                         rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                drawText("El Champinon de vida no sube la salud a 6", left, y + 39.0f * uiScale,
+                         0.23f * uiScale, rgba(0.62f, 0.66f, 0.74f, 0.85f), 0);
+                drawM3Switch(right - swW, y + 10.0f * uiScale, swW, swH, mSettings.diffMaxHealth3);
+            });
+            renderRow(extrasTop + 752.0f * uiScale, 22.0f * uiScale, [&](float y) {
+                drawText("Los archivos originales y las partidas no se modifican.",
+                         left, y + 15.0f * uiScale, 0.22f * uiScale,
+                         rgba(0.55f, 0.60f, 0.68f, 0.86f), 0);
+            });
+            // ---- Randomizer ----
+            const float randoDim = mSettings.randoEnabled ? 1.0f : 0.45f;
+            renderRow(extrasTop + 790.0f * uiScale, 22.0f * uiScale, [&](float y) {
+                drawText("RANDOMIZER", left, y + 15.0f * uiScale, 0.27f * uiScale,
+                         rgba(0.62f, 0.55f, 0.95f, 0.95f), 0);
+            });
+            renderRow(extrasTop + 816.0f * uiScale, 52.0f * uiScale, [&](float y) {
+                drawText("Randomizer", left, y + 21.0f * uiScale, 0.33f * uiScale,
+                         rgba(0.90f, 0.91f, 0.94f, 1.0f), 0);
+                drawText("Mezcla el juego con una semilla (usa una partida nueva)", left, y + 39.0f * uiScale,
+                         0.21f * uiScale, rgba(0.62f, 0.66f, 0.74f, 0.85f), 0);
+                drawM3Switch(right - swW, y + 10.0f * uiScale, swW, swH, mSettings.randoEnabled);
+            });
+            renderRow(extrasTop + 874.0f * uiScale, 92.0f * uiScale, [&](float y) {
+                drawText("Semilla (toca arriba +1, abajo -1)", left, y + 14.0f * uiScale, 0.27f * uiScale,
+                         rgba(0.78f, 0.80f, 0.86f, randoDim), 0);
+                const float cellW = contentW / 6.0f;
+                for (int i = 0; i < 6; i++) {
+                    int scale10 = 1;
+                    for (int j = 0; j < 5 - i; j++) scale10 *= 10;
+                    const int d = (mSettings.randoSeed / scale10) % 10;
+                    const float x0 = left + cellW * i + 3.0f * uiScale;
+                    const float x1 = left + cellW * (i + 1) - 3.0f * uiScale;
+                    drawRoundRect(x0, y + 24.0f * uiScale, x1, y + 84.0f * uiScale, 10.0f * uiScale,
+                                  rgba(0.17f, 0.18f, 0.24f, 0.96f));
+                    drawText("+", (x0 + x1) * 0.5f, y + 38.0f * uiScale, 0.22f * uiScale,
+                             rgba(0.55f, 0.60f, 0.75f, randoDim), 1);
+                    char dg[4];
+                    snprintf(dg, sizeof(dg), "%d", d);
+                    drawText(dg, (x0 + x1) * 0.5f, y + 62.0f * uiScale, 0.46f * uiScale,
+                             rgba(0.92f, 0.93f, 1.0f, randoDim), 1);
+                    drawText("-", (x0 + x1) * 0.5f, y + 78.0f * uiScale, 0.22f * uiScale,
+                             rgba(0.55f, 0.60f, 0.75f, randoDim), 1);
+                }
+            });
+            renderRow(extrasTop + 972.0f * uiScale, 48.0f * uiScale, [&](float y) {
+                const float half = contentW * 0.5f;
+                drawRoundRect(left + 3.0f * uiScale, y + 4.0f * uiScale, left + half - 3.0f * uiScale, y + 44.0f * uiScale,
+                              12.0f * uiScale, rgba(0.30f, 0.24f, 0.62f, 0.98f));
+                drawText("ALEATORIA", left + half * 0.5f, y + 29.0f * uiScale, 0.27f * uiScale,
+                         rgba(0.95f, 0.94f, 1.0f, 1.0f), 1);
+                drawRoundRect(left + half + 3.0f * uiScale, y + 4.0f * uiScale, left + contentW - 3.0f * uiScale,
+                              y + 44.0f * uiScale, 12.0f * uiScale, rgba(0.20f, 0.23f, 0.31f, 0.98f));
+                drawText("COPIAR", left + half * 1.5f, y + 29.0f * uiScale, 0.27f * uiScale,
+                         rgba(0.90f, 0.92f, 0.97f, 1.0f), 1);
+            });
+            struct RandoRow { float y; const char* title; const char* sub; bool on; };
+            const RandoRow randoRows[6] = {
+                {1026.0f, "Galaxias", "Cada puerta del Observatorio lleva a otra galaxia", mSettings.randoGalaxies},
+                {1084.0f, "Posicion de estrellas", "Cada mision carga otra mision de la misma galaxia", mSettings.randoStars},
+                {1142.0f, "Enemigos", "Se cambian por otros parecidos", mSettings.randoEnemies},
+                {1200.0f, "Champinones", "Champinon de vida y de salud intercambiados", mSettings.randoItems},
+                {1258.0f, "Power-ups (arriesgado)", "Abeja, Boo, Fuego, Hielo y Resorte: puede atascarte", mSettings.randoPowerUps},
+                {1316.0f, "Modo desafio", "Garantiza que se puede completar: no cambia power-ups", mSettings.randoChallenge},
+            };
+            for (const RandoRow& rr : randoRows) {
+                renderRow(extrasTop + rr.y * uiScale, 52.0f * uiScale, [&](float y) {
+                    drawText(rr.title, left, y + 21.0f * uiScale, 0.33f * uiScale,
+                             rgba(0.90f, 0.91f, 0.94f, randoDim), 0);
+                    drawText(rr.sub, left, y + 39.0f * uiScale, 0.21f * uiScale,
+                             rgba(0.62f, 0.66f, 0.74f, 0.85f * randoDim), 0);
+                    drawM3Switch(right - swW, y + 10.0f * uiScale, swW, swH, rr.on);
+                });
+            }
+            renderRow(extrasTop + 1380.0f * uiScale, 22.0f * uiScale, [&](float y) {
+                drawText("Puedes cambiarlo a mitad de partida; si te atascas, apagalo. Se aplica al cambiar de escena.",
+                         left, y + 15.0f * uiScale, 0.21f * uiScale,
+                         rgba(0.55f, 0.60f, 0.68f, 0.86f), 0);
+            });
+            renderRow(extrasTop + 1402.0f * uiScale, 22.0f * uiScale, [&](float y) {
+                drawText("La misma semilla da el mismo resultado. Las galaxias de cometa y de jefe final no cambian.",
+                         left, y + 15.0f * uiScale, 0.21f * uiScale,
+                         rgba(0.55f, 0.60f, 0.68f, 0.86f), 0);
             });
         }
         else if (mSettingsTab == 3) {
@@ -3579,7 +4601,8 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
                 drawToggleCard(rightX, rightX + halfW, y, "Control de camara", mSettings.showDpad);
             });
             renderRow(260.0f * uiScale, 52.0f * uiScale, [&](float y) {
-                drawToggleCard(leftX, leftX + contentW, y, "Boton pausa (+)", mSettings.showPauseButton);
+                drawToggleCard(leftX, leftX + halfW, y, "Boton pausa (+)", mSettings.showPauseButton);
+                drawToggleCard(rightX, rightX + halfW, y, "Boton RESET", mSettings.showCamReset);
             });
             renderRow(314.0f * uiScale, 54.0f * uiScale, [&](float y) {
                 drawText("TAMANO", leftX, y + 14.0f * uiScale, 0.32f * uiScale, rgba(0.90f, 0.92f, 0.96f, 1.0f), 0);
@@ -3686,6 +4709,78 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
                 drawInvertCard(leftX, leftX + halfW, "CAMARA EJE X", mSettings.cameraInvertX);
                 drawInvertCard(rightX, rightX + halfW, "CAMARA EJE Y", mSettings.cameraInvertY);
             });
+            auto drawStateCard = [&](float y, const char* label, const char* onText, const char* offText, bool enabled) {
+                drawRoundRect(leftX, y + 2.0f * uiScale, leftX + contentW, y + 48.0f * uiScale,
+                              12.0f * uiScale, rgba(0.13f, 0.15f, 0.19f, 0.96f));
+                drawRoundRect(leftX, y + 2.0f * uiScale, leftX + contentW, y + 48.0f * uiScale,
+                              12.0f * uiScale, rgba(0.31f, 0.34f, 0.40f, 0.52f));
+                drawText(label, leftX + 10.0f * uiScale, y + 21.0f * uiScale,
+                         0.29f * uiScale, rgba(0.91f, 0.93f, 0.97f, 1.0f), 0);
+                drawText(enabled ? onText : offText, leftX + 10.0f * uiScale, y + 38.0f * uiScale,
+                         0.23f * uiScale,
+                         enabled ? rgba(0.48f, 0.88f, 0.73f, 0.95f) : rgba(0.62f, 0.65f, 0.71f, 0.88f), 0);
+                drawM3Switch(leftX + contentW - swW - 8.0f * uiScale, y + 13.0f * uiScale, swW, swH, enabled);
+            };
+            renderRow(952.0f * uiScale, 52.0f * uiScale, [&](float y) {
+                drawStateCard(y, "Joystick de camara (2o stick)", "VISIBLE", "OCULTO", mSettings.showCamStick);
+            });
+            renderRow(1006.0f * uiScale, 54.0f * uiScale, [&](float y) {
+                drawText("TAMANO JOYSTICK CAMARA", leftX, y + 14.0f * uiScale, 0.32f * uiScale, rgba(0.90f, 0.92f, 0.96f, 1.0f), 0);
+                const char* sizeOpts[3] = {"80%", "100%", "125%"};
+                const int idx = fabsf(mSettings.camStickScale - 0.8f) < 0.08f ? 0 : fabsf(mSettings.camStickScale - 1.25f) < 0.08f ? 2 : 1;
+                drawSegmentedGroup(leftX, y + 20.0f * uiScale, contentW, 32.0f * uiScale, sizeOpts, 3, idx);
+            });
+            renderRow(1062.0f * uiScale, 54.0f * uiScale, [&](float y) {
+                drawText("OPACIDAD JOYSTICK CAMARA", leftX, y + 14.0f * uiScale, 0.32f * uiScale, rgba(0.90f, 0.92f, 0.96f, 1.0f), 0);
+                const char* opacityOpts[4] = {"25%", "50%", "75%", "100%"};
+                const int idx = fabsf(mSettings.camStickOpacity - 0.25f) < 0.12f ? 0 :
+                                fabsf(mSettings.camStickOpacity - 0.50f) < 0.12f ? 1 :
+                                fabsf(mSettings.camStickOpacity - 0.75f) < 0.12f ? 2 : 3;
+                drawSegmentedGroup(leftX, y + 20.0f * uiScale, contentW, 32.0f * uiScale, opacityOpts, 4, idx);
+            });
+            renderRow(1118.0f * uiScale, 52.0f * uiScale, [&](float y) {
+                drawStateCard(y, "Camara con el movimiento del celular", "ACTIVADA", "DESACTIVADA", mSettings.gyroCamera);
+            });
+            renderRow(1172.0f * uiScale, 54.0f * uiScale, [&](float y) {
+                drawText("SENSIBILIDAD DEL MOVIMIENTO", leftX, y + 14.0f * uiScale, 0.32f * uiScale, rgba(0.90f, 0.92f, 0.96f, 1.0f), 0);
+                const char* sensOpts[3] = {"Suave", "Normal", "Rapida"};
+                const int idx = mSettings.gyroCameraSens < 0.8f ? 0 : mSettings.gyroCameraSens > 1.3f ? 2 : 1;
+                drawSegmentedGroup(leftX, y + 20.0f * uiScale, contentW, 32.0f * uiScale, sensOpts, 3, idx);
+            });
+            renderRow(1230.0f * uiScale, 60.0f * uiScale, [&](float y) {
+                drawText("SENS. JOYSTICK MOVER", leftX, y + 14.0f * uiScale, 0.27f * uiScale, rgba(0.90f, 0.92f, 0.96f, 1.0f), 0);
+                drawText("SENS. JOYSTICK CAMARA", rightX, y + 14.0f * uiScale, 0.27f * uiScale, rgba(0.90f, 0.92f, 0.96f, 1.0f), 0);
+                const char* sOpts[5] = {"50", "75", "100", "150", "200"};
+                const float sVals[5] = {0.50f, 0.75f, 1.00f, 1.50f, 2.00f};
+                auto sIdx = [&](float cur) {
+                    int best = 0; float bd = 10.0f;
+                    for (int i = 0; i < 5; ++i) { float d = fabsf(cur - sVals[i]); if (d < bd) { bd = d; best = i; } }
+                    return best;
+                };
+                drawSegmentedGroup(leftX, y + 20.0f * uiScale, halfW, 34.0f * uiScale, sOpts, 5, sIdx(mSettings.leftStickSensitivity));
+                drawSegmentedGroup(rightX, y + 20.0f * uiScale, halfW, 34.0f * uiScale, sOpts, 5, sIdx(mSettings.camStickSensitivity));
+            });
+            renderRow(1296.0f * uiScale, 52.0f * uiScale, [&](float y) {
+                drawStateCard(y, "Boton RESET de camara", "VISIBLE", "OCULTO", mSettings.showCamReset);
+            });
+            renderRow(1350.0f * uiScale, 54.0f * uiScale, [&](float y) {
+                drawText("TAMANO BOTON RESET", leftX, y + 14.0f * uiScale, 0.32f * uiScale, rgba(0.90f, 0.92f, 0.96f, 1.0f), 0);
+                const char* sizeOpts[3] = {"80%", "100%", "125%"};
+                const int idx = fabsf(mSettings.camResetScale - 0.8f) < 0.08f ? 0 : fabsf(mSettings.camResetScale - 1.25f) < 0.08f ? 2 : 1;
+                drawSegmentedGroup(leftX, y + 20.0f * uiScale, contentW, 32.0f * uiScale, sizeOpts, 3, idx);
+            });
+            renderRow(1406.0f * uiScale, 54.0f * uiScale, [&](float y) {
+                drawText("OPACIDAD BOTON RESET", leftX, y + 14.0f * uiScale, 0.32f * uiScale, rgba(0.90f, 0.92f, 0.96f, 1.0f), 0);
+                const char* opacityOpts[4] = {"25%", "50%", "75%", "100%"};
+                const int idx = fabsf(mSettings.camResetOpacity - 0.25f) < 0.12f ? 0 :
+                                fabsf(mSettings.camResetOpacity - 0.50f) < 0.12f ? 1 :
+                                fabsf(mSettings.camResetOpacity - 0.75f) < 0.12f ? 2 : 3;
+                drawSegmentedGroup(leftX, y + 20.0f * uiScale, contentW, 32.0f * uiScale, opacityOpts, 4, idx);
+            });
+            renderRow(1466.0f * uiScale, 24.0f * uiScale, [&](float y) {
+                drawText("Gira el celular para mover la camara; ejes invertidos en General > Gyro.",
+                         leftX, y + 15.0f * uiScale, 0.22f * uiScale, rgba(0.55f, 0.60f, 0.68f, 0.86f), 0);
+            });
         }
         else if (mSettingsTab == 4) {
             auto renderRow = [&](float relY, float rowH, auto func) {
@@ -3695,10 +4790,10 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
                 }
             };
             const bool spanish = achievementsUseSpanish();
-            const bool firstUnlocked = mAchievementFirstGameStarted;
-            const int unlockedCount = firstUnlocked ? 1 : 0;
-            const int remainingCount = 1 - unlockedCount;
-            const int progressPercent = firstUnlocked ? 100 : 0;
+            const int totalCount = (int)achv::defs().size();
+            const int unlockedCount = mAch.unlockedCount();
+            const int remainingCount = totalCount - unlockedCount;
+            const int progressPercent = totalCount > 0 ? (unlockedCount * 100) / totalCount : 0;
             uint64_t playedSeconds = mAchievementTotalPlayedSeconds;
             if (mAchievementGameplayActive) {
                 const int64_t nowMs = currentTimeMs();
@@ -3765,8 +4860,8 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
                          leftX + 14.0f * uiScale, y + 23.0f * uiScale,
                          0.28f * uiScale, rgba(0.91f, 0.93f, 0.97f, 1.0f), 0);
                 char progressLabel[48];
-                snprintf(progressLabel, sizeof(progressLabel), "%d%%  -  %d / 1",
-                         progressPercent, unlockedCount);
+                snprintf(progressLabel, sizeof(progressLabel), "%d%%  -  %d / %d",
+                         progressPercent, unlockedCount, totalCount);
                 drawText(progressLabel, rightEdge - 14.0f * uiScale, y + 23.0f * uiScale,
                          0.28f * uiScale, accent, 2);
                 const float barX0 = leftX + 14.0f * uiScale;
@@ -3781,35 +4876,13 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
                 }
                 char countText[64];
                 snprintf(countText, sizeof(countText), spanish
-                             ? "Desbloqueados: %d | Restantes: %d | Total: 1"
-                             : "Unlocked: %d | Remaining: %d | Total: 1",
-                         unlockedCount, remainingCount);
+                             ? "Desbloqueados: %d | Restantes: %d | Total: %d"
+                             : "Unlocked: %d | Remaining: %d | Total: %d",
+                         unlockedCount, remainingCount, totalCount);
                 drawText(countText, leftX + 14.0f * uiScale, y + 75.0f * uiScale,
                          0.25f * uiScale, rgba(0.76f, 0.80f, 0.87f, 0.95f), 0);
             });
-            renderRow(150.0f * uiScale, 124.0f * uiScale, [&](float y) {
-                drawRoundRect(leftX, y + 2.0f * uiScale, rightEdge, y + 118.0f * uiScale,
-                              14.0f * uiScale, cardColor);
-                drawRoundRect(leftX, y + 2.0f * uiScale, rightEdge, y + 118.0f * uiScale,
-                              14.0f * uiScale, borderColor);
-                drawCircle(leftX + 29.0f * uiScale, y + 37.0f * uiScale,
-                           17.0f * uiScale, firstUnlocked ? accent : rgba(0.30f, 0.33f, 0.39f, 1.0f));
-                drawText("01", leftX + 29.0f * uiScale, y + 42.0f * uiScale,
-                         0.25f * uiScale, rgba(0.06f, 0.08f, 0.10f, 1.0f), 1);
-                drawText(spanish ? "Primera aventura" : "First Adventure",
-                         leftX + 56.0f * uiScale, y + 31.0f * uiScale,
-                         0.33f * uiScale, rgba(0.94f, 0.95f, 0.98f, 1.0f), 0);
-                drawText(spanish ? "Inicia tu primera partida." : "Start your first game.",
-                         leftX + 56.0f * uiScale, y + 53.0f * uiScale,
-                         0.26f * uiScale, rgba(0.72f, 0.77f, 0.85f, 0.95f), 0);
-                drawText(firstUnlocked
-                             ? (spanish ? "DESBLOQUEADO" : "UNLOCKED")
-                             : (spanish ? "BLOQUEADO" : "LOCKED"),
-                         leftX + 56.0f * uiScale, y + 83.0f * uiScale,
-                         0.24f * uiScale,
-                         firstUnlocked ? accent : rgba(0.73f, 0.75f, 0.80f, 0.90f), 0);
-            });
-            renderRow(280.0f * uiScale, 112.0f * uiScale, [&](float y) {
+            renderRow(150.0f * uiScale, 112.0f * uiScale, [&](float y) {
                 const float halfW = (contentW - 8.0f * uiScale) * 0.5f;
                 const float rightX = leftX + halfW + 8.0f * uiScale;
                 drawRoundRect(leftX, y + 2.0f * uiScale, leftX + halfW, y + 106.0f * uiScale,
@@ -3832,7 +4905,7 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
                 drawText(lastPlayedText, rightX + 12.0f * uiScale, y + 58.0f * uiScale,
                          0.24f * uiScale, rgba(0.94f, 0.95f, 0.98f, 1.0f), 0);
             });
-            renderRow(408.0f * uiScale, 66.0f * uiScale, [&](float y) {
+            renderRow(268.0f * uiScale, 66.0f * uiScale, [&](float y) {
                 drawRoundRect(leftX, y + 2.0f * uiScale, rightEdge, y + 62.0f * uiScale,
                               14.0f * uiScale, cardColor);
                 drawRoundRect(leftX, y + 2.0f * uiScale, rightEdge, y + 62.0f * uiScale,
@@ -3841,7 +4914,7 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
                          leftX + 14.0f * uiScale, y + 27.0f * uiScale,
                          0.27f * uiScale, rgba(0.91f, 0.93f, 0.97f, 1.0f), 0);
                 drawText(mSettings.achievementNotifications
-                             ? (spanish ? "Activados" : "On")
+                             ? (spanish ? "Activados: duran 10 segundos" : "On: shown for 10 seconds")
                              : (spanish ? "Desactivados" : "Off"),
                          leftX + 14.0f * uiScale, y + 48.0f * uiScale,
                          0.23f * uiScale, rgba(0.70f, 0.75f, 0.84f, 0.92f), 0);
@@ -3849,16 +4922,109 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
                              y + 17.0f * uiScale, swW, swH,
                              mSettings.achievementNotifications);
             });
-            renderRow(482.0f * uiScale, 64.0f * uiScale, [&](float y) {
+            renderRow(340.0f * uiScale, 64.0f * uiScale, [&](float y) {
                 const Color danger = rgba(0.38f, 0.13f, 0.16f, 0.98f);
                 drawRoundRect(leftX, y + 2.0f * uiScale, rightEdge, y + 60.0f * uiScale,
                               14.0f * uiScale, danger);
                 drawRoundRect(leftX, y + 2.0f * uiScale, rightEdge, y + 60.0f * uiScale,
                               14.0f * uiScale, rgba(0.78f, 0.29f, 0.34f, 0.62f));
-                drawText(spanish ? "BORRAR LOGROS OBTENIDOS" : "RESET EARNED ACHIEVEMENTS",
+                drawText(spanish ? "REINICIAR TODOS LOS LOGROS" : "RESET ALL ACHIEVEMENTS",
                          (leftX + rightEdge) * 0.5f, y + 38.0f * uiScale,
                          0.27f * uiScale, rgba(1.0f, 0.91f, 0.92f, 1.0f), 1);
             });
+            renderRow(412.0f * uiScale, 56.0f * uiScale, [&](float y) {
+                const char* filterOptions[3] = {spanish ? "Todos" : "All", spanish ? "Bloqueados" : "Locked",
+                                                spanish ? "Desbloqueados" : "Unlocked"};
+                drawSegmentedGroup(leftX, y + 8.0f * uiScale, contentW, 38.0f * uiScale, filterOptions, 3,
+                                   std::max(0, std::min(2, mAchFilter)));
+            });
+
+            const std::vector<int> achList = achievementFilteredList();
+            const uint64_t achPlaySeconds = achievementPlaySeconds();
+            const std::vector<achv::Def>& achDefs = achv::defs();
+            if (achList.empty()) {
+                renderRow(kAchListTop * uiScale, 40.0f * uiScale, [&](float y) {
+                    drawText(mAchFilter == 1 ? (spanish ? "No te queda ningun logro bloqueado." : "No locked achievements left.")
+                                             : (spanish ? "Aun no hay logros desbloqueados." : "No unlocked achievements yet."),
+                             leftX, y + 24.0f * uiScale, 0.28f * uiScale, rgba(0.70f, 0.75f, 0.84f, 0.92f), 0);
+                });
+            }
+            for (size_t k = 0; k < achList.size(); k++) {
+                renderRow((kAchListTop + (float)k * kAchItemH) * uiScale, kAchItemH * uiScale, [&](float y) {
+                    const int index = achList[k];
+                    const achv::Def& def = achDefs[(size_t)index];
+                    const achv::Progress prog = mAch.progress((size_t)index, achPlaySeconds, mAchievementFirstGameStarted);
+                    drawRoundRect(leftX, y + 2.0f * uiScale, rightEdge, y + 84.0f * uiScale, 14.0f * uiScale, cardColor);
+                    drawRoundRect(leftX, y + 2.0f * uiScale, rightEdge, y + 84.0f * uiScale, 14.0f * uiScale,
+                                  prog.unlocked ? rgba(0.42f, 0.88f, 0.76f, 0.55f) : borderColor);
+                    drawCircle(leftX + 27.0f * uiScale, y + 31.0f * uiScale, 16.0f * uiScale,
+                               prog.unlocked ? accent : rgba(0.30f, 0.33f, 0.39f, 1.0f));
+                    char numberText[8];
+                    snprintf(numberText, sizeof(numberText), "%02d", index + 1);
+                    drawText(numberText, leftX + 27.0f * uiScale, y + 36.0f * uiScale, 0.23f * uiScale,
+                             rgba(0.06f, 0.08f, 0.10f, 1.0f), 1);
+                    const float textX = leftX + 54.0f * uiScale;
+                    const bool canReset = prog.unlocked || prog.current > 0;
+                    const float textMaxW = rightEdge - textX - (canReset ? 106.0f : 12.0f) * uiScale;
+                    auto fitText = [&](const char* text, float baseline, float scale, const Color& color) {
+                        const float width = measureText(text, scale);
+                        if (width > textMaxW && width > 0.0f) scale *= textMaxW / width;
+                        drawText(text, textX, baseline, scale, color, 0);
+                    };
+                    fitText(spanish ? def.es : def.en, y + 26.0f * uiScale, 0.31f * uiScale,
+                            rgba(0.94f, 0.95f, 0.98f, 1.0f));
+                    fitText(spanish ? def.descEs : def.descEn, y + 46.0f * uiScale, 0.24f * uiScale,
+                            rgba(0.72f, 0.77f, 0.85f, 0.95f));
+                    char statusText[96];
+                    if (prog.unlocked) {
+                        const time_t when = static_cast<time_t>(prog.unlockedAt);
+                        struct tm local{};
+                        localtime_r(&when, &local);
+                        static const char* monthsEn[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                                         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+                        static const char* monthsEs[] = {"ene", "feb", "mar", "abr", "may", "jun",
+                                                         "jul", "ago", "sep", "oct", "nov", "dic"};
+                        const int month = std::max(0, std::min(11, local.tm_mon));
+                        snprintf(statusText, sizeof(statusText), "%s  -  %d %s %d",
+                                 spanish ? "DESBLOQUEADO" : "UNLOCKED", local.tm_mday,
+                                 (spanish ? monthsEs : monthsEn)[month], local.tm_year + 1900);
+                    } else if (def.metric == achv::M_PLAY_SECONDS) {
+                        snprintf(statusText, sizeof(statusText), "%s  -  %llu / %llu min",
+                                 spanish ? "BLOQUEADO" : "LOCKED",
+                                 static_cast<unsigned long long>(prog.current / 60),
+                                 static_cast<unsigned long long>(prog.target / 60));
+                    } else if (prog.target > 1) {
+                        snprintf(statusText, sizeof(statusText), "%s  -  %llu / %llu",
+                                 spanish ? "BLOQUEADO" : "LOCKED",
+                                 static_cast<unsigned long long>(prog.current),
+                                 static_cast<unsigned long long>(prog.target));
+                    } else {
+                        snprintf(statusText, sizeof(statusText), "%s", spanish ? "BLOQUEADO" : "LOCKED");
+                    }
+                    if (!prog.unlocked && prog.target > 1) {
+                        const float barX1 = textX + textMaxW;
+                        drawRoundRect(textX, y + 53.0f * uiScale, barX1, y + 59.0f * uiScale, 3.0f * uiScale,
+                                      rgba(0.08f, 0.09f, 0.12f, 1.0f));
+                        if (prog.current > 0) {
+                            drawRoundRect(textX, y + 53.0f * uiScale,
+                                          textX + (barX1 - textX) * ((float)prog.current / (float)prog.target),
+                                          y + 59.0f * uiScale, 3.0f * uiScale, accent);
+                        }
+                    }
+                    drawText(statusText, textX, y + 76.0f * uiScale, 0.22f * uiScale,
+                             prog.unlocked ? accent : rgba(0.73f, 0.75f, 0.80f, 0.90f), 0);
+                    if (canReset) {
+                        const float bx0 = rightEdge - 98.0f * uiScale;
+                        const float bx1 = rightEdge - 10.0f * uiScale;
+                        drawRoundRect(bx0, y + 26.0f * uiScale, bx1, y + 60.0f * uiScale, 11.0f * uiScale,
+                                      rgba(0.38f, 0.13f, 0.16f, 0.98f));
+                        drawRoundRect(bx0, y + 26.0f * uiScale, bx1, y + 60.0f * uiScale, 11.0f * uiScale,
+                                      rgba(0.78f, 0.29f, 0.34f, 0.55f));
+                        drawText(spanish ? "REINICIAR" : "RESET", (bx0 + bx1) * 0.5f, y + 48.0f * uiScale,
+                                 0.21f * uiScale, rgba(1.0f, 0.91f, 0.92f, 1.0f), 1);
+                    }
+                });
+            }
         }
         else {
             // Save Anywhere Tab Content
@@ -3998,28 +5164,23 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
         drawCloseIcon(closeBtnX, closeBtnY, 9.0f * uiScale, rgba(0.761f, 0.776f, 0.812f, 0.95f));
 
         {
-            // Save slots are available in Standard; the mod tab remains Plus-only.
+            // All editions share the same tabs; Mods is now available in Standard too.
             float tabBoxY0 = 62.0f * uiScale;
             float tabBoxY1 = 98.0f * uiScale;
             drawRoundRect(drawerX + padX, tabBoxY0, drawerX + drawerW - padX, tabBoxY1, 18.0f * uiScale, rgba(0.149f, 0.160f, 0.190f, 0.95f));
             drawRoundRect(drawerX + padX, tabBoxY0, drawerX + drawerW - padX, tabBoxY1, 18.0f * uiScale, rgba(0.24f, 0.26f, 0.30f, 0.50f));
 
-            const int visibleTabCount = mPlusEdition ? 5 : 4;
+            const int visibleTabCount = 5;
             const bool spanishAchievements = achievementsUseSpanish();
-            const char* plusLabels[5] = {"General", "Mods",
-                                         spanishAchievements ? "Controles" : "Controls",
-                                         spanishAchievements ? "Ranuras" : "Saves",
-                                         spanishAchievements ? "Logros" : "Achievements"};
-            const int plusTabs[5] = {0, 1, 3, 2, 4};
-            const char* standardLabels[4] = {"General",
-                                             spanishAchievements ? "Controles" : "Controls",
-                                             spanishAchievements ? "Ranuras" : "Saves",
-                                             spanishAchievements ? "Logros" : "Achievements"};
-            const int standardTabs[4] = {0, 3, 2, 4};
+            const char* tabLabels[5] = {"General", "Mods",
+                                        spanishAchievements ? "Controles" : "Controls",
+                                        spanishAchievements ? "Ranuras" : "Saves",
+                                        spanishAchievements ? "Logros" : "Achievements"};
+            const int tabIndexes[5] = {0, 1, 3, 2, 4};
             const float tabSegW = contentW / (float)visibleTabCount;
             for (int i = 0; i < visibleTabCount; ++i) {
-                const char* label = mPlusEdition ? plusLabels[i] : standardLabels[i];
-                const int tab = mPlusEdition ? plusTabs[i] : standardTabs[i];
+                const char* label = tabLabels[i];
+                const int tab = tabIndexes[i];
                 const float x0 = drawerX + padX + (float)i * tabSegW;
                 const float x1 = x0 + tabSegW;
                 const bool active = (mSettingsTab == tab);
@@ -4028,7 +5189,7 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
                                   x1 - 2.0f * uiScale, tabBoxY1 - 2.0f * uiScale,
                                   16.0f * uiScale, rgba(0.14f, 0.28f, 0.48f, 0.95f));
                 }
-                const float labelScale = mPlusEdition ? 0.27f * uiScale : 0.30f * uiScale;
+                const float labelScale = 0.26f * uiScale;
                 const Color textColor = active ? rgba(1.0f, 1.0f, 1.0f, 1.0f)
                                                : rgba(0.68f, 0.71f, 0.77f, 0.75f);
                 drawText(label, (x0 + x1) * 0.5f, tabBoxY0 + 23.0f * uiScale,
@@ -4159,7 +5320,19 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
     // -------------------------------------------------------------
     if (mSaveToastTimer > 0.0f) {
         float toastAlpha = std::min(1.0f, mSaveToastTimer * 2.0f);
-        float toastW = 320.0f * uiScale;
+        const char* toastText = mToastMessage.empty() ? "Game Progress Saved Anywhere!" : mToastMessage.c_str();
+        const float toastBase = 0.35f * uiScale;
+        const float toastPadL = 42.0f * uiScale;
+        const float toastPadR = 20.0f * uiScale;
+        const float toastMaxW = w - 24.0f * uiScale;
+        float toastTextScale = toastBase;
+        float toastTextW = measureText(toastText, toastTextScale);
+        float toastW = std::max(320.0f * uiScale, toastTextW + toastPadL + toastPadR);
+        if (toastW > toastMaxW) {
+            toastW = toastMaxW;
+            const float avail = toastW - toastPadL - toastPadR;
+            if (toastTextW > avail && toastTextW > 0.0f) toastTextScale = toastBase * avail / toastTextW;
+        }
         float toastH = 44.0f * uiScale;
         float toastX = (w - toastW) * 0.5f;
         float toastY = 56.0f * uiScale;
@@ -4172,24 +5345,83 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
         drawCircle(toastX + 24.0f * uiScale, toastY + toastH * 0.5f, 9.0f * uiScale, rgba(0.18f, 0.85f, 0.55f, toastAlpha));
         drawCircle(toastX + 24.0f * uiScale, toastY + toastH * 0.5f, 4.0f * uiScale, rgba(1.0f, 1.0f, 1.0f, toastAlpha));
 
-        drawText(mToastMessage.empty() ? "Game Progress Saved Anywhere!" : mToastMessage.c_str(), toastX + 42.0f * uiScale, toastY + toastH * 0.5f + 5.0f * uiScale, 0.35f * uiScale, rgba(0.95f, 1.0f, 0.97f, toastAlpha), 0);
+        drawText(toastText, toastX + toastPadL, toastY + toastH * 0.5f + 5.0f * uiScale, toastTextScale, rgba(0.95f, 1.0f, 0.97f, toastAlpha), 0);
     }
 
-    if (mSettings.achievementNotifications &&
-        currentTimeMs() < mAchievementToastUntilMs) {
-        const float toastW = std::min(450.0f * uiScale, w - 24.0f * uiScale);
-        const float toastH = 44.0f * uiScale;
-        const float toastX = (w - toastW) * 0.5f;
-        const float toastY = 8.0f * uiScale;
-        drawRoundRect(toastX, toastY, toastX + toastW, toastY + toastH,
-                      18.0f * uiScale, rgba(0.05f, 0.14f, 0.13f, 0.97f));
-        drawRoundRect(toastX, toastY, toastX + toastW, toastY + toastH,
-                      18.0f * uiScale, rgba(0.35f, 0.88f, 0.75f, 0.90f));
-        drawCircle(toastX + 23.0f * uiScale, toastY + toastH * 0.5f,
-                   7.0f * uiScale, rgba(0.40f, 0.93f, 0.79f, 1.0f));
-        drawText(mAchievementToastMessage.c_str(), toastX + toastW * 0.5f,
-                 toastY + toastH * 0.5f + 5.0f * uiScale,
-                 0.29f * uiScale, rgba(0.96f, 1.0f, 0.98f, 1.0f), 1);
+    {
+        AchToast achToast;
+        bool achShow = false;
+        float achAgeMs = 0.0f;
+        int achQueued = 0;
+        if (mSettings.achievementNotifications) {
+            std::lock_guard<std::mutex> lock(mAchToastLock);
+            const int64_t nowMs = currentTimeMs();
+            if (mAchToastActive && nowMs - mAchToastStartMs >= kAchToastMs) mAchToastActive = false;
+            if (!mAchToastActive && !mAchToastQueue.empty()) {
+                mAchToastCurrent = mAchToastQueue.front();
+                mAchToastQueue.erase(mAchToastQueue.begin());
+                mAchToastActive = true;
+                mAchToastStartMs = nowMs;
+            }
+            if (mAchToastActive) {
+                achShow = true;
+                achToast = mAchToastCurrent;
+                achAgeMs = (float)(nowMs - mAchToastStartMs);
+                achQueued = (int)mAchToastQueue.size();
+            }
+        }
+        if (achShow) {
+            const float toastW = std::min(760.0f * uiScale, w - 24.0f * uiScale);
+            const float toastH = 104.0f * uiScale;
+            const float toastX = (w - toastW) * 0.5f;
+            // Slides down from above, stays, then slides back up.
+            const float slideInMs = 280.0f, slideOutMs = 350.0f;
+            float slide = 0.0f;
+            if (achAgeMs < slideInMs) {
+                const float t = achAgeMs / slideInMs;
+                slide = 1.0f - (1.0f - (1.0f - t) * (1.0f - t));
+            } else if (achAgeMs > (float)kAchToastMs - slideOutMs) {
+                const float t = std::min(1.0f, (achAgeMs - ((float)kAchToastMs - slideOutMs)) / slideOutMs);
+                slide = t * t;
+            }
+            const float toastY = 10.0f * uiScale - slide * (toastH + 24.0f * uiScale);
+            const Color accentColor = rgba(0.42f, 0.88f, 0.76f, 1.0f);
+            // A thin accent border around a dark, almost opaque card: the text must stay readable
+            // over any bright scene (the border used to be drawn as a second full fill).
+            drawRoundRect(toastX, toastY, toastX + toastW, toastY + toastH, 22.0f * uiScale,
+                          rgba(0.42f, 0.88f, 0.76f, 0.95f));
+            drawRoundRect(toastX + 2.5f * uiScale, toastY + 2.5f * uiScale, toastX + toastW - 2.5f * uiScale,
+                          toastY + toastH - 2.5f * uiScale, 19.5f * uiScale, rgba(0.03f, 0.07f, 0.09f, 0.97f));
+            drawCircle(toastX + 48.0f * uiScale, toastY + toastH * 0.5f, 28.0f * uiScale, accentColor);
+            drawCircle(toastX + 48.0f * uiScale, toastY + toastH * 0.5f, 20.0f * uiScale,
+                       rgba(0.03f, 0.07f, 0.09f, 1.0f));
+            drawCircle(toastX + 48.0f * uiScale, toastY + toastH * 0.5f, 9.0f * uiScale, accentColor);
+            const float textX = toastX + 92.0f * uiScale;
+            const float textMaxW = toastX + toastW - textX - 18.0f * uiScale;
+            auto fitToast = [&](const std::string& text, float baseline, float scale, const Color& color) {
+                const float width = measureText(text.c_str(), scale);
+                if (width > textMaxW && width > 0.0f) scale *= textMaxW / width;
+                drawText(text.c_str(), textX, baseline, scale, color, 0);
+            };
+            fitToast(achToast.title, toastY + 29.0f * uiScale, 0.27f * uiScale, accentColor);
+            fitToast(achToast.name, toastY + 61.0f * uiScale, 0.44f * uiScale, rgba(0.96f, 1.0f, 0.98f, 1.0f));
+            fitToast(achToast.desc, toastY + 84.0f * uiScale, 0.28f * uiScale, rgba(0.84f, 0.90f, 0.92f, 1.0f));
+            if (achQueued > 0) {
+                char more[16];
+                snprintf(more, sizeof(more), "+%d", achQueued);
+                drawText(more, toastX + toastW - 20.0f * uiScale, toastY + 29.0f * uiScale, 0.27f * uiScale,
+                         accentColor, 2);
+            }
+            // Time left, as a bar along the bottom edge.
+            const float left = std::max(0.0f, 1.0f - achAgeMs / (float)kAchToastMs);
+            const float barX0 = toastX + 22.0f * uiScale, barX1 = toastX + toastW - 22.0f * uiScale;
+            drawRoundRect(barX0, toastY + toastH - 10.0f * uiScale, barX1, toastY + toastH - 6.0f * uiScale,
+                          2.0f * uiScale, rgba(0.14f, 0.24f, 0.26f, 1.0f));
+            if (left > 0.0f) {
+                drawRoundRect(barX0, toastY + toastH - 10.0f * uiScale, barX0 + (barX1 - barX0) * left,
+                              toastY + toastH - 6.0f * uiScale, 2.0f * uiScale, accentColor);
+            }
+        }
     }
 
     if (mAchievementClearConfirm) {
@@ -4208,13 +5440,26 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
         drawRoundRect(dialogX0, dialogY0, dialogX1, dialogY1,
                       20.0f * uiScale, rgba(0.39f, 0.43f, 0.50f, 0.75f));
         const bool spanish = achievementsUseSpanish();
-        drawText(spanish ? "¿Borrar logros obtenidos?" : "Reset earned achievements?",
+        const bool resetOneAch = mAchResetIndex >= 0 && (size_t)mAchResetIndex < achv::defs().size();
+        drawText(resetOneAch ? (spanish ? "¿Reiniciar este logro?" : "Reset this achievement?")
+                             : (spanish ? "¿Reiniciar todos los logros?" : "Reset every achievement?"),
                  (dialogX0 + dialogX1) * 0.5f, dialogY0 + 39.0f * uiScale,
                  0.34f * uiScale, rgba(0.96f, 0.97f, 1.0f, 1.0f), 1);
-        drawText(spanish ? "El tiempo jugado y la ultima partida se conservan."
-                         : "Playtime and last played will be kept.",
-                 (dialogX0 + dialogX1) * 0.5f, dialogY0 + 82.0f * uiScale,
-                 0.25f * uiScale, rgba(0.74f, 0.78f, 0.86f, 1.0f), 1);
+        {
+            std::string body;
+            if (resetOneAch) {
+                const achv::Def& d = achv::defs()[(size_t)mAchResetIndex];
+                body = std::string(spanish ? d.es : d.en) + (spanish ? ": vuelve a empezar de cero." : ": starts again from zero.");
+            } else {
+                body = spanish ? "El tiempo jugado y la ultima partida se conservan."
+                               : "Playtime and last played will be kept.";
+            }
+            float bodyScale = 0.25f * uiScale;
+            const float bodyW = measureText(body.c_str(), bodyScale);
+            if (bodyW > dialogW - 32.0f * uiScale && bodyW > 0.0f) bodyScale *= (dialogW - 32.0f * uiScale) / bodyW;
+            drawText(body.c_str(), (dialogX0 + dialogX1) * 0.5f, dialogY0 + 82.0f * uiScale, bodyScale,
+                     rgba(0.74f, 0.78f, 0.86f, 1.0f), 1);
+        }
         drawRoundRect(dialogX0 + 16.0f * uiScale, buttonY0,
                       splitX - 6.0f * uiScale, buttonY1,
                       12.0f * uiScale, rgba(0.23f, 0.26f, 0.32f, 1.0f));
@@ -4224,7 +5469,7 @@ void UIOverlay::generateVertices(int screenW, int screenH, std::vector<UIVertex>
         drawText(spanish ? "CANCELAR" : "CANCEL",
                  (dialogX0 + splitX) * 0.5f, buttonY0 + 29.0f * uiScale,
                  0.25f * uiScale, rgba(0.93f, 0.95f, 0.99f, 1.0f), 1);
-        drawText(spanish ? "BORRAR" : "RESET",
+        drawText(spanish ? "REINICIAR" : "RESET",
                  (splitX + dialogX1) * 0.5f, buttonY0 + 29.0f * uiScale,
                  0.25f * uiScale, rgba(1.0f, 0.94f, 0.94f, 1.0f), 1);
     }
@@ -4301,6 +5546,10 @@ void UIOverlay::clearLayoutOffsets() {
     mSettings.pauseOffsetY = 0.0f;
     mSettings.dpadOffsetX = 0.0f;
     mSettings.dpadOffsetY = 0.0f;
+    mSettings.camStickOffsetX = 0.0f;
+    mSettings.camStickOffsetY = 0.0f;
+    mSettings.camResetOffsetX = 0.0f;
+    mSettings.camResetOffsetY = 0.0f;
 }
 
 void UIOverlay::resetLayoutOffsets() {

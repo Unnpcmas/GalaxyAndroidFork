@@ -7,6 +7,10 @@
 #include "Game/Util/SceneUtil.hpp"
 #include "Game/Util/StringUtil.hpp"
 
+#if defined(__ANDROID__)
+extern "C" void port_mobile_achievement_event(const char* kind, const char* a, const char* b, int n);
+#endif
+
 struct GalaxyTimeLimitInfo {
     /* 0x0 */ const char* mGalaxyName;
     /* 0x4 */ s32 mScenarioNo;
@@ -91,4 +95,9 @@ u32 CometEventKeeper::getTimeLimitFromTable(const GalaxyTimeLimitInfo* pTable, i
 void CometEventKeeper::initCometStatus() {
     mCometName = MR::makeCurrentGalaxyStatusAccessor().getCometName(MR::getCurrentScenarioNo());
     mCometStateIndex = MR::getGalaxyCometStateIndexInCurrentStage();
+#if defined(__ANDROID__)
+    if (mCometName != nullptr && mCometName[0] != '\0') {
+        port_mobile_achievement_event("comet", mCometName, MR::getCurrentStageName(), MR::getCurrentScenarioNo());
+    }
+#endif
 }

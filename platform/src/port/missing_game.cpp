@@ -48,8 +48,19 @@ extern "C" {
 __attribute__((weak)) int port_is_fullscreen_aspect(void) { return 0; }
 __attribute__((weak)) float port_get_display_aspect(void) { return 16.0f / 9.0f; }
 __attribute__((weak)) int port_is_fly_mode(void) { return 0; }
+__attribute__((weak)) int port_is_force_luigi(void) { return 0; }
 __attribute__((weak)) int port_is_skip_cutscenes(void) { return 0; }
 __attribute__((weak)) int port_is_infinite_health(void) { return 0; }
+__attribute__((weak)) int port_difficulty_enemy_damage(void) { return 1; }
+__attribute__((weak)) int port_difficulty_boss_damage(void) { return 1; }
+__attribute__((weak)) int port_difficulty_one_hit(void) { return 0; }
+__attribute__((weak)) int port_difficulty_no_heal(void) { return 0; }
+__attribute__((weak)) int port_difficulty_max_health_3(void) { return 0; }
+__attribute__((weak)) int port_rando_active(void) { return 0; }
+__attribute__((weak)) const char* port_rando_galaxy(const char* stage) { return stage; }
+__attribute__((weak)) int port_rando_scenario(const char*, int selected, int) { return selected; }
+__attribute__((weak)) const char* port_rando_object(const char* name) { return name; }
+__attribute__((weak)) void port_rando_commit(void) {}
 __attribute__((weak)) int port_is_infinite_lives(void) { return 0; }
 __attribute__((weak)) int port_is_infinite_starbits(void) { return 0; }
 __attribute__((weak)) int port_is_shield_hd_textures(void) { return 1; }

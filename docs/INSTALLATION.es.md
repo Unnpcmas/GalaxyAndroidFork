@@ -31,7 +31,7 @@ El APK unificado puede extraer y convertir localmente la imagen de disco; no hac
 
 1. Copia la imagen del disco a la carpeta `Download` del teléfono.
 2. Formatos admitidos por el preparador: `.rvz`, `.wbfs`, `.iso`, `.wia`, `.ciso` y `.zip`.
-3. Instala el [APK ARM64 v0.0.32](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.32/GalaxyAndroid-v0.0.32-arm64.apk).
+3. Instala el [APK ARM64 v0.0.38](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.38/GalaxyAndroid-v0.0.38-arm64.apk).
 4. Abre Galaxy Android y concede el acceso a archivos que solicite para leer la imagen y guardar los datos en `/sdcard/GalaxyData`.
 5. En la pantalla de preparación, elige la imagen. Activa la opción de incluir cinemáticas solo si quieres esos archivos.
 6. Inicia la preparación y espera a que termine antes de cerrar la aplicación.
@@ -63,7 +63,7 @@ Este método es opcional. Necesitas Windows, macOS o Linux, Python 3.8 o posteri
    ```
 5. Instala el APK incluido en el repositorio y abre la aplicación:
    ```bash
-   adb install -r downloads/GalaxyAndroid-v0.0.32-arm64.apk
+   adb install -r downloads/GalaxyAndroid-v0.0.38-arm64.apk
    adb shell am start -n com.openport.galaxyandroid/.MainActivity
    ```
 
@@ -72,7 +72,7 @@ Este método es opcional. Necesitas Windows, macOS o Linux, Python 3.8 o posteri
 ### Se cierra al iniciar o cargar
 
 - Comprueba los permisos de archivos y que los datos estén en `/sdcard/GalaxyData`.
-- La versión 0.0.32 es de desarrollo y no garantiza resolver todos los cierres de cada dispositivo. Si puedes, exporta el registro de diagnóstico y conserva una copia aparte de las partidas antes de reinstalar o cargar un estado.
+- El mantenedor confirmó que la versión 0.0.38 inicia en un Samsung Galaxy S25 FE; la compatibilidad puede variar en otros dispositivos. Si se cierra, exporta el registro de diagnóstico y conserva una copia aparte de las partidas antes de reinstalar o cargar un estado.
 
 ### El puntero se mueve en dirección incorrecta
 

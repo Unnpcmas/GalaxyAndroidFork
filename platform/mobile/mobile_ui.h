@@ -6,6 +6,9 @@
 #include "port/input.h"
 
 #include <vector>
+#include "achievements.h"
+
+extern "C" int port_android_choose_mod_zip(const char* modsDirectory);
 
 namespace mobile_ui {
 
@@ -78,10 +81,48 @@ struct Settings {
 
     // Advanced Mods (off by default)
     bool modFly = false;
+    // Second (camera) joystick, motion camera, adaptive quality and FOV
+    bool showCamStick = true;
+    float camStickScale = 1.0f;      // 0.8 / 1.0 / 1.25
+    float camStickOpacity = 0.75f;   // 0.25 .. 1.0
+    float camStickSensitivity = 1.0f; // touch camera stick gain 0.5 .. 2.0
+    float camStickOffsetX = 0.0f;
+    float camStickOffsetY = 0.0f;
+    bool showCamReset = true;        // the "reset camera" button
+    float camResetScale = 1.0f;      // 0.8 / 1.0 / 1.25
+    float camResetOpacity = 0.75f;   // 0.25 .. 1.0
+    float camResetOffsetX = 0.0f;    // from its default place beside the camera joystick
+    float camResetOffsetY = 0.0f;
+    bool gyroCamera = false;         // move the phone to turn the camera (off by default)
+    float gyroCameraSens = 1.0f;     // 0.6 soft / 1.0 normal / 1.6 fast
+    bool adaptiveQuality = true;     // lower FXAA while the frame rate stays low
+    int fovOffset = 0;               // degrees added to the game's FOV (0 = untouched)
+    bool modLuigi = false;      // saved: play as Luigi (applies on the next stage load)
+    bool modFreeCamera = false; // runtime only (not saved): free camera, see freecam.h
     bool modSkipCutscenes = false;
     bool modInfiniteHealth = false;
     bool modInfiniteLives = false;
     bool modInfiniteStarBits = false;
+
+    // Difficulty (Mods tab). Damage values are multipliers of the hit's health cost.
+    int diffEnemyDamage = 1;       // 1..4: health lost per hit from enemies and hazards
+    int diffBossDamage = 1;        // 1..4: same, while fighting in a boss galaxy
+    bool diffOneHit = false;       // any damage is lethal
+    bool diffNoHeal = false;       // hearts, coins and mushrooms do not restore health
+    bool diffMaxHealth3 = false;   // the Life Mushroom does not raise the health meter to 6
+
+    // Randomizer (Mods tab): a seeded shuffle; the same seed always gives the same game.
+    bool randoEnabled = false;
+    int randoSeed = 123456;        // 0..999999, shown as six digits
+    bool randoGalaxies = true;     // which galaxy is behind each galaxy door
+    bool randoStars = true;        // which mission is loaded when a mission is picked
+    bool randoEnemies = true;      // enemies swapped inside families that behave alike
+    bool randoItems = true;        // mushrooms swapped with each other
+    bool randoPowerUps = false;    // power-ups swapped too (can get you stuck; never in challenge mode)
+    bool randoChallenge = false;   // keeps the game completable: forbids swapping power-ups
+
+    // Log (General tab): false keeps only ERROR/FATAL lines.
+    bool logEnabled = true;
 
     // Game Speed Multiplier (1 = 1x, 2 = 1.5x, 3 = 2x, 4 = 3x, 5 = 4x)
     int gameSpeed = 1;
@@ -92,12 +133,14 @@ struct Settings {
 
     // Render quality (0 = 480p, 1 = 720p, 2 = 1080p, 3 = 1440p, 4 = 3840px 4K long edge)
     int renderScale = 2;
+    // Post-process FXAA quality level (0 = off, 1..12 = progressively softer edge filtering).
+    int antialiasingLevel = 0;
 
     // Haptic feedback (off by default)
     bool haptics = false;
 
     // FPS configuration
-    int targetFps = 60;  // 30, 60, 90, 120, or 144
+    int targetFps = 60;  // 60 (native); 30 only through Battery Saver
     bool adaptiveFps = true;
     bool batterySaver = false; // 30 FPS thermal protection & power save mode
     bool gyroAiming = false;   // Gyroscope / accelerometer Star Pointer motion aiming
@@ -112,6 +155,7 @@ struct Settings {
 
     void load(const std::string& path);
     void save(const std::string& path) const;
+    void logMods(const char* why) const;  // every mod and difficulty value, one line each
 };
 
 class UIOverlay {
@@ -122,9 +166,14 @@ public:
     void setSavePath(const std::string& path);
     void setAchievementsPath(const std::string& path);
     void setGameplayActive(bool active);
+    bool isGameplayActive() const { return mAchievementGameplayActive; }
     void pauseAchievementSession();
     void resumeAchievementSession();
     void tickAchievementSession();
+    // Facts from the game (see port_mobile_achievement_* in mobile_ui.cpp).
+    void achievementPoll(int userFile, int stars, int starMax, int grandStars, int starBits, int coins, int lives);
+    void achievementStage(const char* stage, bool luigi);
+    void achievementEvent(const char* kind, const char* a, const char* b, int n);
 
     // Per-frame tick to handle pulse buttons, auto-release, and hardware metrics
     void update(PortPadState& pad, int& spinFrames);
@@ -136,6 +185,15 @@ public:
     bool isStickActive() const { return mStickPointerId >= 0; }
     float getTouchStickX() const { return (mStickPointerId >= 0) ? mTouchStickX : 0.0f; }
     float getTouchStickY() const { return (mStickPointerId >= 0) ? mTouchStickY : 0.0f; }
+
+    // Camera (right) touch joystick: -1..1, right / up positive; 0 when released.
+    float getCamStickX() const { return (mCamStickPointerId >= 0) ? mCamStickX : 0.0f; }
+    float getCamStickY() const { return (mCamStickPointerId >= 0) ? mCamStickY : 0.0f; }
+    // Centre and radius (pixels) of the camera joystick: shared by the touch
+    // handling, the drawing and the layout editor; always inside the screen.
+    void camStickGeometry(int screenW, int screenH, float& cx, float& cy, float& r) const;
+    // The "reset camera" button sits beside the camera joystick (same rules).
+    void camResetGeometry(int screenW, int screenH, float& cx, float& cy, float& r) const;
 
     // Processes an Android motion or key event.
     // Returns true if consumed (e.g., settings menu or virtual controls).
@@ -153,6 +211,8 @@ public:
 
     // Call when a frame is presented to display to track true presented FPS
     void reportFramePresented();
+    // Called once per NEW game frame (not for repeated or UI-only presents).
+    void reportGameFramePresented();
 
     bool needsRedraw();
     bool isSettingsOpen() const { return mSettingsOpen || mDrawerAnim > 0.01f; }
@@ -237,8 +297,27 @@ private:
     bool mAchievementResumeAfterPause = false;
     bool mAchievementClearConfirm = false;
     bool mGamepadConnected = false;
-    int64_t mAchievementToastUntilMs = 0;
-    std::string mAchievementToastMessage;
+    int64_t mAchievementToastUntilMs = 0;   // legacy (unused)
+    std::string mAchievementToastMessage;   // legacy (unused)
+
+    // Achievements (see achievements.h)
+    achv::Tracker mAch;
+    int mAchFilter = 0;          // 0 = all, 1 = locked only, 2 = unlocked only
+    int mAchResetIndex = -1;     // -1 = reset every achievement, otherwise the one to reset
+    int64_t mAchLastEvalMs = 0;
+    struct AchToast {
+        std::string title, name, desc;
+    };
+    std::mutex mAchToastLock;
+    std::vector<AchToast> mAchToastQueue;
+    AchToast mAchToastCurrent;
+    bool mAchToastActive = false;
+    int64_t mAchToastStartMs = 0;
+    static constexpr int64_t kAchToastMs = 10000;
+    uint64_t achievementPlaySeconds() const;
+    void evaluateAchievements();
+    std::vector<int> achievementFilteredList() const;
+    float achievementsTabContentHeight() const;
     int mSaveSlot = 1;
     int mLoadSlot = 1;
     int mOverwriteConfirmSlot = 0;
@@ -282,6 +361,16 @@ private:
     float mTouchStickX = 0.0f;
     float mTouchStickY = 0.0f;
 
+    // Camera joystick state
+    int mCamStickPointerId = -1;
+    float mCamStickKnobX = 0.0f;
+    float mCamStickKnobY = 0.0f;
+    float mCamStickX = 0.0f;
+    float mCamStickY = 0.0f;
+    int64_t mCamResetFlashUntilMs = 0;
+    float mInitialCamOfsX = 0.0f, mInitialCamOfsY = 0.0f;
+    float mInitialResetOfsX = 0.0f, mInitialResetOfsY = 0.0f;
+
     // Button press states (for visual press effect)
     bool mBtnAPressed = false;
     bool mBtnBPressed = false;
@@ -315,6 +404,8 @@ private:
         BTN_Z,
         BTN_SPIN,
         BTN_PLUS,
+        CAM_STICK,
+        CAM_RESET,
         STAR_POINTER
     };
 
@@ -341,6 +432,8 @@ private:
     float mCurrentFps = 60.0f;
     float mAvgFrameTimeMs = 16.6f;
     int mFpsFrameCounter = 0;
+    int mGameFrameCounter = 0;
+    float mGameFps = 60.0f;
     int64_t mFpsLastTimeNs = 0;
     float mCpuUsagePercent = 0.0f;
     float mGpuUsagePercent = 0.0f;

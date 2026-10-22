@@ -30,6 +30,10 @@ typedef struct PortPadState {
 // Called by the input layer (any thread).
 void port_input_set(int chan, const PortPadState* state);
 
+// While blocked, the game sees a neutral pad on channel 0 (sticks and buttons
+// zero); the free camera takes the controls instead.
+void port_input_block_game(int blocked);
+
 // Query right analog stick deflection (-1..1).
 void port_input_get_right_stick(int chan, float* x, float* y);
 

@@ -1,1 +1,1 @@
-7e1369f52f3db216afafcca83501ad1e770abae9b62fb7dda26badb3f525641b  GalaxyAndroid-v0.0.32-arm64.apk
+93cf4851c5a08d5693d7890d6dfc478257da3f7a140d46dd15e896de8cc36d20  GalaxyAndroid-v0.0.38-arm64.apk

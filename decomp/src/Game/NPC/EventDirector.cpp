@@ -6,6 +6,10 @@
 #include "Game/NPC/StageStateKeeper.hpp"
 #include "Game/NPC/TimeAttackEventKeeper.hpp"
 #include "Game/Scene/SceneObjHolder.hpp"
+#include "Game/Util/SceneUtil.hpp"
+
+// Achievements: which object raised a Power Star (bosses give away the defeat).
+extern "C" void port_mobile_achievement_event(const char* kind, const char* a, const char* b, int n);
 
 EventDirector::EventDirector()
     : NameObj("\x83\x43\x83\x78\x83\x93\x83\x67\x8e\x77\x8a\xf6"), mPowerStarEventKeeper(), mStageStateKeeper(), mPowerStarHolder(), mCometEventKeeper(), mTimeAttackEventKeeper() {
@@ -88,6 +92,9 @@ namespace MR {
     }
 
     void appearEventPowerStar(const char* pParam1, s32 param2, const TVec3f* pParam3, bool param4, bool param5) {
+#if defined(__ANDROID__)
+        port_mobile_achievement_event("star_request", pParam1, MR::getCurrentStageName(), MR::getCurrentScenarioNo());
+#endif
         EventFunction::getPowerStarEventKeeper()->requestAppearPowerStar(pParam1, param2, pParam3, param4, param5);
     }
 

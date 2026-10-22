@@ -40,6 +40,6 @@ Experimental builds made with a different certificate are not updates for existi
 With Android SDK Build Tools installed:
 
 ```bash
-apksigner verify --print-certs downloads/GalaxyAndroid-v0.0.32-arm64.apk
-adb install -r downloads/GalaxyAndroid-v0.0.32-arm64.apk
+apksigner verify --print-certs downloads/GalaxyAndroid-v0.0.38-arm64.apk
+adb install -r downloads/GalaxyAndroid-v0.0.38-arm64.apk
 ```

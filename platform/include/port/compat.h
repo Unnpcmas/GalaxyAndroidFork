@@ -179,8 +179,25 @@ int port_input_real_z(void);
 float port_get_display_aspect(void);
 int port_is_fullscreen_aspect(void);
 int port_is_fly_mode(void);
+int port_is_force_luigi(void);
 int port_is_skip_cutscenes(void);
 int port_is_infinite_health(void);
+// Difficulty (Mods tab): health lost per hit (1..4; boss = while in a boss galaxy),
+// one-hit KO, no healing, health meter capped at 3.
+int port_difficulty_enemy_damage(void);
+int port_difficulty_boss_damage(void);
+int port_difficulty_one_hit(void);
+int port_difficulty_no_heal(void);
+int port_difficulty_max_health_3(void);
+// Randomizer (Mods tab): seeded shuffle of galaxy doors, missions, enemies and items.
+// Every function returns its input unchanged when the randomizer is off.
+int port_rando_active(void);
+const char* port_rando_galaxy(const char* stage);
+int port_rando_scenario(const char* stage, int selected, int normalCount);
+const char* port_rando_object(const char* name);
+// Freezes the object randomization for the scene that is about to load (called at the start of a
+// scene change), so changing the settings mid-game never mixes two configurations in one load.
+void port_rando_commit(void);
 int port_is_infinite_lives(void);
 int port_is_infinite_starbits(void);
 void port_set_game_speed(float speed);

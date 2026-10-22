@@ -8,11 +8,14 @@
 //   release halt    -> with the last voices released: one sub-frame mixed, then 0xDCD10004,0xF355FF00
 //   0x81/0x8E etc.  -> 0xDCD10004, 0xF355<word0 >> 16> (DspFinishWork)
 // Mixing is delegated to port_dsp_mix_frame (silence until the mixer lands).
+#include <setjmp.h>
+#include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -35,10 +38,30 @@ DSPTaskInfo* __DSP_tmp_task;
 void __DSPHandler(__OSInterrupt interrupt, OSContext* context);
 }
 
-static std::mutex sMailMutex;
-static std::deque<u32> sMailFromDsp;
+// These containers live for the whole run but are touched from emulated game threads
+// (the audio thread), where plain operator new allocates inside the game's JKRHeap.
+// That heap is reset on every scene change, which corrupted the deque (fault inside
+// queueMail() with sMailMutex held -> the recovery longjmp left it locked -> the
+// audio thread, which owns the emulated CPU, froze the whole game).  Keep their
+// storage in the host heap.
+template <typename T> struct HostAlloc {
+    using value_type = T;
+    HostAlloc() = default;
+    template <typename U> HostAlloc(const HostAlloc<U>&) {}
+    T* allocate(size_t n) {
+        void* p = ::malloc(n ? n * sizeof(T) : 1);
+        if (!p) abort();
+        return static_cast<T*>(p);
+    }
+    void deallocate(T* p, size_t) { ::free(p); }
+    template <typename U> bool operator==(const HostAlloc<U>&) const { return true; }
+    template <typename U> bool operator!=(const HostAlloc<U>&) const { return false; }
+};
 
-static std::vector<u32> sPacket;
+static std::mutex sMailMutex;
+static std::deque<u32, HostAlloc<u32>> sMailFromDsp;
+
+static std::vector<u32, HostAlloc<u32>> sPacket;
 static u32 sPacketExpected = 0;
 static bool sWaitingCount = true;
 static u32 sVaramBase = 0;
@@ -86,8 +109,53 @@ static struct {
     s16* outR = nullptr;
 } sFrame;
 
-static void executePacket() {
-    const std::vector<u32>& p = sPacket;
+extern "C" void port_crash_guard_set(void* jb);
+extern "C" unsigned port_crash_guard_faults(void);
+extern "C" unsigned long port_crash_guard_last_offset(void);
+extern "C" unsigned long port_crash_guard_last_addr(void);
+
+
+// ---- Mixer hold during scene changes ------------------------------------------
+// While the game destroys a scene and swaps the wave banks, the voices the mixer
+// follows live in memory the game is freeing and reloading.  Rendering then reads
+// stale structures (logged as "audio fault recovered"), and after such a fault the
+// scene change was seen to stall for good.  So the game asks us to hold the mixer:
+// sub-frames are still counted and answered exactly as before, they are just
+// silent and touch no guest voice data.  A deadline releases the hold by itself.
+static std::atomic<int64_t> sMixHoldUntilMs{0};
+static std::atomic<unsigned> sMixHeldSubFrames{0};
+
+static int64_t dspNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+extern "C" void port_dsp_hold_mixer(int ms) {
+    if (ms > 0) {
+        if (sMixHoldUntilMs.load() == 0) {
+            port_log("dsp: mixer held during the scene change (up to %d ms)", ms);
+            sMixHeldSubFrames = 0;
+        }
+        sMixHoldUntilMs = dspNowMs() + ms;
+    } else if (sMixHoldUntilMs.exchange(0) != 0) {
+        port_log("dsp: mixer released (%u sub-frames were silent)", sMixHeldSubFrames.load());
+    }
+}
+
+static bool mixerHeld() {
+    int64_t until = sMixHoldUntilMs.load();
+    if (until == 0) return false;
+    if (dspNowMs() < until) return true;
+    if (sMixHoldUntilMs.compare_exchange_strong(until, 0)) {
+        port_log("dsp: mixer hold timed out; releasing (%u sub-frames were silent)", sMixHeldSubFrames.load());
+    }
+    return false;
+}
+
+static volatile int sStep = 0;  // where a recovered fault happened (1 held memset, 2 mixer, 3 mail/irq)
+
+static void executePacketInner() {
+    const std::vector<u32, HostAlloc<u32>>& p = sPacket;
     u32 w0 = p.empty() ? 0 : p[0];
     u32 cmd = w0 >> 24;
     switch (cmd) {
@@ -115,9 +183,20 @@ static void executePacket() {
     case 0x00:  // release halt: voices 0 .. 16 * (group + 1) - 1 are ready for the sub-frame
         if (((w0 >> 16) & 0xFF) == 3 && sFrame.done < sFrame.subFrames) {
             if (sFrame.outL && sFrame.outR) {
-                port_dsp_mix_frame(1, sFrame.outL + sFrame.done * 80, sFrame.outR + sFrame.done * 80, sMixerLevel);
+                if (mixerHeld()) {
+                    sStep = 1;
+                    memset(sFrame.outL + sFrame.done * 80, 0, 80 * sizeof(s16));
+                    memset(sFrame.outR + sFrame.done * 80, 0, 80 * sizeof(s16));
+                    sMixHeldSubFrames++;
+                } else {
+                    // The mixer follows pointers the game wrote; executePacket() holds
+                    // the recovery point for a stale one.
+                    sStep = 2;
+                    port_dsp_mix_frame(1, sFrame.outL + sFrame.done * 80, sFrame.outR + sFrame.done * 80, sMixerLevel);
+                }
             }
             sFrame.done++;
+            sStep = 3;
             queueMail(0xDCD10004, 0xF355FF00);
         }
         break;
@@ -134,6 +213,40 @@ static void executePacket() {
     default:
         // Other control words need no reply.
         break;
+    }
+    port_irq_raise(PORT_IRQ_DSP);
+}
+
+
+// Every command is executed under a recovery point: the audio thread races the
+// game's scene changes, and a stale guest pointer must cost one silent
+// sub-frame (the mail the game waits for is still sent), not the app.
+static void executePacket() {
+    const u32 w0 = sPacket.empty() ? 0 : sPacket[0];
+    sigjmp_buf guard;
+    sStep = 0;
+    port_crash_guard_set(&guard);
+    if (sigsetjmp(guard, 1) == 0) {
+        executePacketInner();
+        port_crash_guard_set(nullptr);
+        return;
+    }
+    port_crash_guard_set(nullptr);
+    static unsigned sReported = 0;
+    if (sReported++ < 8) {
+        port_log("dsp: audio fault recovered (#%u) cmd=0x%02x at libgame+0x%lx, address 0x%lx; sub-frame muted (step %d, frame %u/%u, L=%p R=%p, held=%d)",
+                 port_crash_guard_faults(), w0 >> 24, port_crash_guard_last_offset(), port_crash_guard_last_addr(), (int)sStep,
+                 sFrame.done, sFrame.subFrames, (void*)sFrame.outL, (void*)sFrame.outR, (int)(sMixHoldUntilMs.load() != 0));
+    }
+    if ((w0 >> 24) == 0x00 && ((w0 >> 16) & 0xFF) == 3 && sFrame.done < sFrame.subFrames) {
+        if (sFrame.outL && sFrame.outR) {
+            memset(sFrame.outL + sFrame.done * 80, 0, 80 * sizeof(s16));
+            memset(sFrame.outR + sFrame.done * 80, 0, 80 * sizeof(s16));
+        }
+        sFrame.done++;
+        queueMail(0xDCD10004, 0xF355FF00);
+    } else if ((w0 >> 24) == 0x81) {
+        queueMail(0xDCD10004, 0xF3550000 | (w0 >> 16));
     }
     port_irq_raise(PORT_IRQ_DSP);
 }

@@ -41,6 +41,10 @@
 #if defined(__ANDROID__)
 extern "C" void port_mobile_achievement_set_gameplay_active(int active);
 extern "C" void port_mobile_achievement_tick(void);
+extern "C" void port_mobile_achievement_poll(int userFile, int stars, int starMax, int grandStars, int starBits,
+                                             int coins, int lives);
+extern "C" void port_mobile_achievement_stage(const char* stage, int luigi);
+extern "C" void port_crash_set_scene(const char* scene, const char* stage);
 #endif
 
 #define GX_FIFO_SIZE 0x80000
@@ -74,6 +78,16 @@ namespace {
     char sQuickLoadStage[128] = {};
     int64_t sQuickLoadSceneDeadlineNs = 0;
     bool sQuickLoadSawSceneTransition = false;
+    // Timings for the save/load log lines.
+    bool sAchievementGameplay = false;
+    int sAchievementPollFrames = 0;
+    int64_t sSaveQueuedNs = 0;
+    int64_t sSaveStartedNs = 0;
+    int64_t sLoadQueuedNs = 0;
+    int64_t sLoadStagedNs = 0;
+    inline double msSince(int64_t startNs) {
+        return startNs > 0 ? (double)(port_host_time_ns() - startNs) / 1.0e6 : -1.0;
+    }
 }
 
 extern "C" void port_game_quick_save_result(int success) {
@@ -83,8 +97,9 @@ extern "C" void port_game_quick_save_result(int success) {
     }
     sQuickSaveSequenceDone = true;
     sQuickSaveSequenceSucceeded = success != 0;
-    port_log(success ? "save: native GameData write completed successfully" :
-                      "ERROR save: native GameData write failed");
+    port_log(success ? "save: native GameData write completed successfully (%.0f ms after it started)" :
+                      "ERROR save: native GameData write failed (%.0f ms after it started)",
+             msSince(sSaveStartedNs));
 }
 
 #ifdef TARGET_PC
@@ -294,7 +309,11 @@ void GameSystem::frameLoop() {
             port_mobile_save_slot_result(requestedSaveSlot, 0);
         } else {
             sQueuedQuickSaveSlot = requestedSaveSlot;
-            port_log("save: queued slot %d; waiting for the game save sequence", requestedSaveSlot);
+            sSaveQueuedNs = port_host_time_ns();
+            const char* queuedStage = MR::getCurrentStageName();
+            port_log("save: queued slot %d; waiting for the game save sequence (stage=%s userFile=%d player=%s)",
+                     requestedSaveSlot, queuedStage ? queuedStage : "(unknown)", GameDataFunction::getUserFileIndex(),
+                     GameDataFunction::isDataMario() ? "Mario" : "Luigi");
         }
     }
 
@@ -318,8 +337,10 @@ void GameSystem::frameLoop() {
             sQuickLoadSceneDeadlineNs = 0;
             sQuickLoadSawSceneTransition = false;
             sQuickLoadPhase = QuickLoadPhase::WaitForSaveSequence;
-            port_log("load: queued slot %d from stage %s",
-                     sQuickLoadSlot, sQuickLoadStage[0] ? sQuickLoadStage : "(unknown)");
+            sLoadQueuedNs = port_host_time_ns();
+            port_log("load: queued slot %d from stage %s (current userFile=%d player=%s)",
+                     sQuickLoadSlot, sQuickLoadStage[0] ? sQuickLoadStage : "(unknown)", sQuickLoadUserFileIndex,
+                     sQuickLoadPlayerMario ? "Mario" : "Luigi");
         }
     }
 
@@ -332,8 +353,9 @@ void GameSystem::frameLoop() {
         if (GameSequenceFunction::quickSaveAnywhere()) {
             sRunningQuickSaveSlot = slot;
             const char* stage = MR::getCurrentStageName();
-            port_log("save: game-data write started for slot %d stage=%s",
-                     slot, stage ? stage : "(unknown)");
+            sSaveStartedNs = port_host_time_ns();
+            port_log("save: game-data write started for slot %d stage=%s (waited %.0f ms for the game's save sequence)",
+                     slot, stage ? stage : "(unknown)", msSince(sSaveQueuedNs));
         } else {
             port_log("ERROR save: game could not start save sequence for slot %d", slot);
             port_mobile_save_slot_result(slot, 0);
@@ -350,11 +372,42 @@ void GameSystem::frameLoop() {
             std::strcmp(info.mScene, "Game") == 0 &&
             std::strcmp(info.mStage, "FileSelect") != 0 &&
             std::strcmp(info.mStage, "Title") != 0;
+        static int64_t sPrevSceneStartNs = 0;
+        static int sSceneCount = 0;
+        const int64_t nowNs = port_host_time_ns();
+        port_log("engine: scene #%d started scene=%s stage=%s gameplay=%d (previous scene lasted %.1f s)",
+                 ++sSceneCount, info.mScene, info.mStage, gameplayScene ? 1 : 0,
+                 sPrevSceneStartNs > 0 ? (double)(nowNs - sPrevSceneStartNs) / 1.0e9 : 0.0);
+        sPrevSceneStartNs = nowNs;
         port_log("achievements: scene started scene=%s stage=%s gameplay=%d",
                  info.mScene, info.mStage, gameplayScene ? 1 : 0);
+        port_crash_set_scene(info.mScene, info.mStage);
         port_mobile_achievement_set_gameplay_active(gameplayScene ? 1 : 0);
+        sAchievementGameplay = gameplayScene;
+        sAchievementPollFrames = 0;
+        if (gameplayScene) {
+            port_mobile_achievement_stage(info.mStage, GameDataFunction::isDataMario() ? 0 : 1);
+        }
     }
     port_mobile_achievement_tick();
+    // Facts for the achievements, about once a second while playing.
+    if (sAchievementGameplay && ++sAchievementPollFrames >= 60 && MR::isInitializeStateEnd()) {
+        sAchievementPollFrames = 0;
+        static int sStarMax = 0;
+        if (sStarMax <= 0) {
+            sStarMax = GameDataFunction::getPowerStarNumMax();
+        }
+        int grandStars = 0;
+        for (int i = 1; i <= 7; i++) {
+            if (GameDataFunction::hasGrandStar(i)) {
+                grandStars++;
+            }
+        }
+        port_mobile_achievement_poll(GameDataFunction::getUserFileIndex(), GameDataFunction::calcCurrentPowerStarNum(),
+                                     sStarMax, grandStars,
+                                     GameDataFunction::getStarPieceNum(), MR::getCoinNum(),
+                                     GameDataFunction::getPlayerLeft());
+    }
 #endif
 
     if (sRunningQuickSaveSlot >= 0 && sQuickSaveSequenceDone) {
@@ -366,9 +419,9 @@ void GameSystem::frameLoop() {
             success = port_nand_snapshot_save_slot(
                           slot, activeUserFileIndex, isPlayerMario ? 1 : 0) != 0;
         }
-        port_log(success ? "save: slot %d finished and verified" :
-                           "ERROR save: slot %d failed; active game data was left intact",
-                 slot);
+        port_log(success ? "save: slot %d finished and verified (%.0f ms from the request, %.0f ms after the game's write ended)" :
+                           "ERROR save: slot %d failed; active game data was left intact (%.0f ms from the request, %.0f ms after the game's write ended)",
+                 slot, msSince(sSaveQueuedNs), msSince(sSaveStartedNs));
         port_mobile_save_slot_result(slot, success ? 1 : 0);
         sRunningQuickSaveSlot = -1;
         sQuickSaveSequenceDone = false;
@@ -393,9 +446,10 @@ void GameSystem::frameLoop() {
             }
             GameSequenceFunction::startPreLoadSaveDataSequence();
             sQuickLoadPhase = QuickLoadPhase::WaitForPreload;
-            port_log("load: slot %d staged; loading GameData.bin for user file=%d player=%s",
+            sLoadStagedNs = port_host_time_ns();
+            port_log("load: slot %d staged; loading GameData.bin for user file=%d player=%s (%.0f ms after the request)",
                      sQuickLoadSlot, sQuickLoadUserFileIndex,
-                     sQuickLoadPlayerMario ? "Mario" : "Luigi");
+                     sQuickLoadPlayerMario ? "Mario" : "Luigi", msSince(sLoadQueuedNs));
         } else {
             port_log("ERROR load: could not stage slot %d; current save was not replaced",
                      sQuickLoadSlot);
@@ -418,10 +472,10 @@ void GameSystem::frameLoop() {
                 sQuickLoadSceneDeadlineNs = port_host_time_ns() + 30LL * 1000000000LL;
                 sQuickLoadSawSceneTransition = false;
                 sQuickLoadPhase = QuickLoadPhase::WaitForSceneStart;
-                port_log("load: slot %d GameData validated; transition requested from stage=%s userFile=%d player=%s",
+                port_log("load: slot %d GameData validated; transition requested from stage=%s userFile=%d player=%s (%.0f ms after the request)",
                          slot, sQuickLoadStage[0] ? sQuickLoadStage : "(unknown)",
                          sQuickLoadUserFileIndex,
-                         sQuickLoadPlayerMario ? "Mario" : "Luigi");
+                         sQuickLoadPlayerMario ? "Mario" : "Luigi", msSince(sLoadQueuedNs));
             } else {
                 const bool rolledBack = port_nand_rollback_restore() != 0;
                 port_log(rolledBack
@@ -473,9 +527,10 @@ void GameSystem::frameLoop() {
             const char* stage = MR::getCurrentStageName();
             const bool committed = port_nand_commit_restore() != 0;
             port_log(committed
-                         ? "load: slot %d loaded; gameplay scene started stage=%s"
-                         : "WARN load: slot %d gameplay scene started stage=%s; rollback cleanup remains pending",
-                     slot, stage ? stage : "(unknown)");
+                         ? "load: slot %d loaded; gameplay scene started stage=%s (userFile=%d player=%s, %.0f ms in total)"
+                         : "WARN load: slot %d gameplay scene started stage=%s; rollback cleanup remains pending (userFile=%d player=%s, %.0f ms in total)",
+                     slot, stage ? stage : "(unknown)", GameDataFunction::getUserFileIndex(),
+                     GameDataFunction::isDataMario() ? "Mario" : "Luigi", msSince(sLoadQueuedNs));
             port_mobile_load_slot_result(slot, 1);
             sQuickLoadSlot = -1;
             sQuickLoadStage[0] = '\0';

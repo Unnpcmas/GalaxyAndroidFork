@@ -1,5 +1,7 @@
 #include "Game/Player/MarioActor.hpp"
 #include "port/port.h"
+#include "Game/Util/SceneUtil.hpp"
+#include <string.h>
 #include "Game/Animation/XanimeCore.hpp"
 #include "Game/Camera/CameraTargetArg.hpp"
 #include "Game/Enemy/KariKariDirector.hpp"
@@ -1579,6 +1581,36 @@ void MarioActor::setUpperRotateY(f32 angle) {
     mMarioAnim->setUpperRotateY(angle);
 }
 
+// Difficulty settings (Mods tab). changeMaxLife() steps the health with
+// decLife/incLife one point at a time, so it bypasses the difficulty rules.
+static bool sDifficultyBypass = false;
+
+// Boss galaxies are recognised by name; an unknown one simply counts as normal.
+static bool isBossGalaxy() {
+    const char* stage = MR::getCurrentStageName();
+    if (!stage) {
+        return false;
+    }
+    static const char* const kBossMarkers[] = {"Koopa", "BattleShip", "Boss", "DinoPackun", "Kamella", "Bowser"};
+    for (const char* marker : kBossMarkers) {
+        if (strstr(stage, marker)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static u32 difficultyHitCost() {
+    if (sDifficultyBypass) {
+        return 1;
+    }
+    if (port_difficulty_one_hit()) {
+        return 999;
+    }
+    const int mult = isBossGalaxy() ? port_difficulty_boss_damage() : port_difficulty_enemy_damage();
+    return mult < 1 ? 1 : (u32)mult;
+}
+
 void MarioActor::decLife(u16 amt) {
     if (port_is_infinite_health()) {
         mHealth = mMaxHealth;
@@ -1599,7 +1631,8 @@ void MarioActor::decLife(u16 amt) {
     }
 
     if (mHealth) {
-        mHealth--;
+        const u32 cost = difficultyHitCost();
+        mHealth = mHealth > cost ? mHealth - cost : 0;
     }
 
     _388 = 0;
@@ -1670,6 +1703,10 @@ const char* MarioActor_FORCE_MATCH_DATA() {
 }
 
 void MarioActor::incLife(u32 amt) {
+    if (port_difficulty_no_heal() && !sDifficultyBypass) {
+        return;
+    }
+
     if (isEnableNerveChange() && !_3E4) {
         const u32 health = getHealth();
         if (mHealth != mMaxHealth) {
@@ -1692,6 +1729,11 @@ void MarioActor::incLife(u32 amt) {
 }
 
 void MarioActor::changeMaxLife(s32 max) {
+    if (port_difficulty_max_health_3() && max > 3) {
+        max = 3;
+    }
+
+    sDifficultyBypass = true;
     mMaxHealth = max;
     while (mHealth != max) {
         if (mHealth > max) {
@@ -1702,6 +1744,7 @@ void MarioActor::changeMaxLife(s32 max) {
             break;
         }
     }
+    sDifficultyBypass = false;
 }
 
 bool MarioActor::doPressing() {

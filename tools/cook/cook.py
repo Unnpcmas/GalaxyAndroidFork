@@ -316,6 +316,42 @@ def convert(data_dir, out_dir, jobs=None, only=None, no_audio=False,
     return 1 if errors else 0
 
 
+def convert_mod(mod_dir, out_dir, progress=None):
+    """Converts a mod's original (console-format) resources.
+
+    <mod_dir>/files/... is cooked into <out_dir>/files/... with the same
+    conversion the disc gets, one file at a time (no sys/ data is needed).
+    Only run this on files that still have their original byte order: an
+    already-converted file would be swapped back and corrupted.
+
+    Returns 0 when every file converted, 1 otherwise (failed files are
+    reported and, where the cooker supports it, copied unchanged).
+    """
+    files_dir = os.path.join(mod_dir, 'files')
+    if not os.path.isdir(files_dir):
+        print('ERROR %s has no files/ folder' % mod_dir)
+        return 1
+    args = argparse.Namespace(only=None, no_audio=False, with_movies=True)
+    jobs = plan(mod_dir, out_dir, args)
+    if progress:
+        progress(0, len(jobs))
+    errors = []
+    total = collections.Counter()
+    for done, result in enumerate((process(job) for job in jobs), 1):
+        stats, _notes, err = result[0], result[1], result[2]
+        total.update(stats)
+        if err:
+            errors.append(err)
+        if progress:
+            progress(done, len(jobs))
+    print('cooked %d mod files' % len(jobs))
+    for k, v in sorted(total.items()):
+        print('  %-24s %6d' % (k, v))
+    for e in errors[:20]:
+        print('ERROR', e)
+    return 1 if errors else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('data_dir')

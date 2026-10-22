@@ -174,7 +174,7 @@ public class CookerEngine {
         if (!scriptsDir.exists()) scriptsDir.mkdirs();
 
         // Unpack pythonhome.zip if not already extracted (force re-extract for ARM64)
-        File stdlibMarker = new File(pythonHomeDir, ".extracted_arm64_py315_v1");
+        File stdlibMarker = new File(pythonHomeDir, ".extracted_arm64_py315_v2");
         if (!stdlibMarker.exists()) {
             if (callback != null) callback.onLog("[Setup] Unpacking embedded Python standard library (ARM64)...");
             deleteRecursive(pythonHomeDir);

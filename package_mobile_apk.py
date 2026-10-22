@@ -83,7 +83,7 @@ KEYTOOL = shutil.which("keytool") or "keytool"
 # An APK can only replace an already installed one when both carry the same
 # signing certificate; anything else makes Android refuse the update with
 # INSTALL_FAILED_UPDATE_INCOMPATIBLE and forces the player to uninstall first
-# The certificate is therefore pinned: the build signs
+# (issues #35 and #36).  The certificate is therefore pinned: the build signs
 # with the project key and then proves, from the finished APK, that it did.
 # The digest is a public value; it is what tells a packaged APK apart from one
 # signed with a freshly generated (and therefore incompatible) key.
@@ -330,18 +330,21 @@ def main():
     for lib in game_libs:
         src_lib = os.path.join(BUILD_MOBILE, lib)
         dst_lib = os.path.join(arm64_dir, lib)
-        if os.path.exists(src_lib):
-            if STRIP and os.path.exists(STRIP):
-                run([STRIP, "--strip-unneeded", "-o", dst_lib, src_lib])
-            else:
-                shutil.copyfile(src_lib, dst_lib)
+        if not os.path.isfile(src_lib):
+            raise SystemExit(f"REFUSING TO PACKAGE: required native library is missing: {src_lib}")
+        if STRIP and os.path.exists(STRIP):
+            # libgame keeps its function names for the log; GALAXY_STRIP_SYMBOLS=1 drops them
+            # too (only .dynsym stays) - try it first, a log that needs .symtab would go blank.
+            keep_names = lib == "libgame.so" and os.environ.get("GALAXY_STRIP_SYMBOLS") != "1"
+            run([STRIP, "--strip-debug" if keep_names else "--strip-unneeded", "-o", dst_lib, src_lib])
         else:
-            print(f"[WARN] Native library {src_lib} not found in build directory.")
+            shutil.copyfile(src_lib, dst_lib)
 
     # Cooker and disc extractor libraries
     nodtool_src = os.path.join(INSTALLER_DIR, "vendor", "nodtool", "libnodtool.so")
-    if os.path.exists(nodtool_src):
-        shutil.copyfile(nodtool_src, os.path.join(arm64_dir, "libnodtool.so"))
+    if not os.path.isfile(nodtool_src):
+        raise SystemExit(f"REFUSING TO PACKAGE: required disc-tool library is missing: {nodtool_src}")
+    shutil.copyfile(nodtool_src, os.path.join(arm64_dir, "libnodtool.so"))
 
     installer_candidates = [
         os.path.join(BUILD_MOBILE, "libinstaller.so"),
@@ -359,14 +362,25 @@ def main():
             installer_found = True
             break
     if not installer_found:
-        print("[WARN] libinstaller.so not found in any build candidate path!")
+        raise SystemExit("REFUSING TO PACKAGE: required libinstaller.so was not built.")
 
     # Python runtime libraries
     py_lib_dir = os.path.join(INSTALLER_DIR, "vendor", "python", "lib", "arm64-v8a")
-    if os.path.isdir(py_lib_dir):
-        for lib in os.listdir(py_lib_dir):
-            if lib.endswith(".so"):
-                shutil.copyfile(os.path.join(py_lib_dir, lib), os.path.join(arm64_dir, lib))
+    # libssl/libcrypto/libsqlite3 were only dlopen'd by the _ssl/_hashlib/_sqlite3
+    # extension modules, which the trimmed pythonhome.zip no longer contains
+    # (tools/trim_pythonhome.py); the cooker never imports them.
+    required_python_libs = {
+        "libpython3.15.so",
+    }
+    if not os.path.isdir(py_lib_dir):
+        raise SystemExit(f"REFUSING TO PACKAGE: Python native runtime is missing: {py_lib_dir}")
+    present_python_libs = {name for name in os.listdir(py_lib_dir) if name.endswith(".so")}
+    missing_python_libs = required_python_libs - present_python_libs
+    if missing_python_libs:
+        raise SystemExit("REFUSING TO PACKAGE: Python native runtime is incomplete: " +
+                         ", ".join(sorted(missing_python_libs)))
+    for lib in sorted(required_python_libs):
+        shutil.copyfile(os.path.join(py_lib_dir, lib), os.path.join(arm64_dir, lib))
 
     # Extra prebuilt libraries (e.g. Vulkan validation layers)
     extra_libs_dir = os.path.join(ROOT, "platform", "mobile", "libs", "arm64-v8a")
@@ -393,6 +407,17 @@ def main():
         if not os.path.exists(pyhome_target):
             raise RuntimeError("CRITICAL ERROR: pythonhome.zip is missing! Cannot build APK without Python environment.")
 
+        # The stdlib archive that is really packaged must not contain extension modules
+        # whose libraries are no longer shipped, or `import ssl` / `import sqlite3`
+        # would fail at run time.
+        with zipfile.ZipFile(pyhome_target) as zf:
+            stale = [n for n in zf.namelist()
+                     if re.search(r"lib-dynload/(_ssl|_hashlib|_sqlite3)\.", n)]
+        if stale:
+            raise SystemExit("REFUSING TO PACKAGE: pythonhome.zip still contains extension modules "
+                             "that need libssl/libcrypto/libsqlite3, which are no longer packaged:\n  " +
+                             "\n  ".join(stale) + "\nRe-run tools/trim_pythonhome.py on the stdlib archive.")
+
         if os.path.isdir(assets_dir):
             for root, dirs, files in os.walk(assets_dir):
                 dirs[:] = [d for d in dirs if d != "__pycache__"]
@@ -408,6 +433,7 @@ def main():
             (os.path.join(ROOT, "LICENSE"), "assets/licenses/GPL-3.0.txt"),
             (os.path.join(ROOT, "THIRD_PARTY_NOTICES.md"), "assets/licenses/THIRD_PARTY_NOTICES.md"),
             (os.path.join(ROOT, "decomp", "LICENSE-Petari.txt"), "assets/licenses/Petari-CC0-1.0.txt"),
+            (os.path.join(ROOT, "CHANGELOG.es.md"), "assets/changelog/CHANGELOG.es.md"),
         ]
         for source, archive_path in license_assets:
             if not os.path.isfile(source):
@@ -420,10 +446,14 @@ def main():
         compressed_aux_native_libs = {
             "libnodtool.so",
             "libpython3.15.so",
-            "libcrypto_python.so",
-            "libssl_python.so",
-            "libsqlite3_python.so",
         }
+        # Optional: GALAXY_COMPRESS_NATIVE=1 also deflates the game libraries.  Safe
+        # with extractNativeLibs=true (checked below): Android extracts every lib to
+        # nativeLibraryDir at install time and the launcher/wrap.sh load them from
+        # there, so the APK only gets smaller.  Off by default until tried on a phone.
+        if os.environ.get("GALAXY_COMPRESS_NATIVE") == "1":
+            compressed_aux_native_libs |= {"libgame.so", "libmain.so", "libreserve.so", "libinstaller.so"}
+            print("[APK] GALAXY_COMPRESS_NATIVE=1: deflating game libraries inside the APK")
         manifest_path = os.path.join(ROOT, "platform", "mobile", "AndroidManifest.xml")
         with open(manifest_path, "r", encoding="utf-8") as manifest_file:
             manifest_text = manifest_file.read()
@@ -447,6 +477,23 @@ def main():
                 info.external_attr = (0o100755 << 16) if (f.endswith(".so") or f.endswith(".sh")) else (0o100644 << 16)
                 with open(p, "rb") as f_data:
                     z.writestr(info, f_data.read())
+
+    required_entries = {
+        "classes.dex",
+        "assets/pythonhome.zip",
+        "lib/arm64-v8a/wrap.sh",
+        "lib/arm64-v8a/libgame.so",
+        "lib/arm64-v8a/libmain.so",
+        "lib/arm64-v8a/libreserve.so",
+        "lib/arm64-v8a/libinstaller.so",
+        "lib/arm64-v8a/libnodtool.so",
+        "lib/arm64-v8a/libpython3.15.so",
+    }
+    with zipfile.ZipFile(base_apk, "r") as packaged:
+        missing_entries = required_entries - set(packaged.namelist())
+    if missing_entries:
+        raise SystemExit("REFUSING TO PACKAGE: APK payload is incomplete: " +
+                         ", ".join(sorted(missing_entries)))
 
     # 6. Zipalign (16KB page alignment required for Android 14/15 Snapdragon 8 Gen 2/3 / Adreno 740/840)
     aligned_apk = os.path.join(OUT, "aligned.apk")

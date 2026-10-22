@@ -16,6 +16,9 @@
 #include "Game/Util/SceneUtil.hpp"
 #include "Game/Util/StringUtil.hpp"
 #include <cstdio>
+#ifdef TARGET_PC
+#include "port/port.h"
+#endif
 
 void EventUtil_FORCE_MATCH_STRINGS() {
     MR::isEqualString("\x83\x6e\x83\x60\x83\x7d\x83\x8a\x83\x49\x8f\x89\x95\xcf\x90\x67", "\x83\x6e\x83\x60\x83\x7d\x83\x8a\x83\x49\x8f\x89\x95\xcf\x90\x67");
@@ -149,6 +152,12 @@ namespace MR {
     }
 
     bool isPlayerLuigi() {
+#ifdef TARGET_PC
+        // Mod "Jugar como Luigi": Luigi's model, voice and texts on Mario's own save.
+        if (port_is_force_luigi()) {
+            return true;
+        }
+#endif
         return !GameDataFunction::isDataMario();
     }
 

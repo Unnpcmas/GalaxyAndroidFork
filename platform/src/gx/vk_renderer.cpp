@@ -1,3 +1,4 @@
+#include "port/heap_routing.h"
 #include "vk_renderer.h"
 
 #include <android/log.h>
@@ -56,6 +57,7 @@ uint64_t vkDeviceGeneration() {
 
 void queueVkTextureDelete(uint64_t image, uint64_t memory, uint64_t view) {
     if (!image && !memory && !view) return;
+    PortHostAllocScope hostAlloc;  // may run on a game thread; the vector must not live in the game heap
     std::lock_guard<std::mutex> lock(sVkDeleteLock);
     VkPendingDelete d;
     d.image = image;
@@ -986,13 +988,19 @@ bool VkRenderer::createSwapchain() {
         vkGetPhysicalDeviceSurfacePresentModesKHR(mPhysicalDevice, mSurface, &modeCount, presentModes.data());
     }
 
+    // FIFO (vsync) is the low-power mode and is always supported.  MAILBOX keeps
+    // extra images in flight and lets frames land at arbitrary points of the
+    // refresh, which with the CPU-side limiter makes GPU load and frame times
+    // wander and costs heat.  Build with -DGALAXY_VK_MAILBOX=1 to restore it.
     VkPresentModeKHR chosenPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+#if defined(GALAXY_VK_MAILBOX) && GALAXY_VK_MAILBOX
     for (auto pm : presentModes) {
         if (pm == VK_PRESENT_MODE_MAILBOX_KHR) {
             chosenPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
             break;
         }
     }
+#endif
 
     sci.preTransform = preTransform;
     // Android surfaces do not always support OPAQUE: asking for it regardless
@@ -1360,6 +1368,12 @@ bool VkRenderer::createPresentationPipeline() {
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &mPresentDescLayout;
+    VkPushConstantRange presentPushRange{};
+    presentPushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    presentPushRange.offset = 0;
+    presentPushRange.size = 16;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &presentPushRange;
 
     if (vkCreatePipelineLayout(mDevice, &plci, nullptr, &mPresentPipelineLayout) != VK_SUCCESS) {
         return false;
@@ -1391,8 +1405,53 @@ void main() {
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 outColor;
 layout(set = 0, binding = 0) uniform sampler2D s_target;
+layout(push_constant) uniform PresentParams {
+    vec4 values; // inverse target size, FXAA quality 0..12, reserved
+} pc;
+vec4 sampleScene(vec2 uv) {
+    return texture(s_target, clamp(uv, vec2(0.0), vec2(1.0)));
+}
+float luma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
 void main() {
-    outColor = texture(s_target, v_uv);
+    vec4 center = sampleScene(v_uv);
+    int level = int(pc.values.z + 0.5);
+    if (level <= 0) {
+        outColor = center;
+        return;
+    }
+
+    vec2 texel = pc.values.xy;
+    float nw = luma(sampleScene(v_uv + vec2(-texel.x, -texel.y)).rgb);
+    float ne = luma(sampleScene(v_uv + vec2( texel.x, -texel.y)).rgb);
+    float sw = luma(sampleScene(v_uv + vec2(-texel.x,  texel.y)).rgb);
+    float se = luma(sampleScene(v_uv + vec2( texel.x,  texel.y)).rgb);
+    float m = luma(center.rgb);
+    float minLuma = min(m, min(min(nw, ne), min(sw, se)));
+    float maxLuma = max(m, max(max(nw, ne), max(sw, se)));
+    float quality = clamp(float(level) / 12.0, 0.0, 1.0);
+    float threshold = max(mix(0.125, 0.035, quality), maxLuma * mix(0.10, 0.045, quality));
+    if (maxLuma - minLuma < threshold) {
+        outColor = center;
+        return;
+    }
+
+    vec2 direction = vec2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));
+    float reduction = max((nw + ne + sw + se) * (0.25 * mix(0.125, 0.0625, quality)), 1.0 / 128.0);
+    direction = clamp(direction / (min(abs(direction.x), abs(direction.y)) + reduction),
+                      vec2(-1.0), vec2(1.0));
+    direction *= texel * mix(1.0, 6.0, quality);
+
+    vec3 a = 0.5 * (
+        sampleScene(v_uv + direction * (1.0 / 3.0 - 0.5)).rgb +
+        sampleScene(v_uv + direction * (2.0 / 3.0 - 0.5)).rgb);
+    vec3 b = a * 0.5 + 0.25 * (
+        sampleScene(v_uv + direction * -0.5).rgb +
+        sampleScene(v_uv + direction *  0.5).rgb);
+    float lumaB = luma(b);
+    vec3 result = (lumaB < minLuma || lumaB > maxLuma) ? a : b;
+    outColor = vec4(result, center.a);
 }
 )";
 
@@ -3578,7 +3637,8 @@ bool VkRenderer::render(VkTarget& target, const EyeView* eye, VkTarget* hud, Hud
     return true;
 }
 
-void VkRenderer::present(const VkTarget& target, int vpX, int vpY, int vpW, int vpH) {
+void VkRenderer::present(const VkTarget& target, int vpX, int vpY, int vpW, int vpH,
+                         int antialiasingLevel) {
     std::lock_guard<std::recursive_mutex> lock(mRenderMutex);
     if (!mInitialized || mFatal || mSwapchain == VK_NULL_HANDLE || target.colorView == VK_NULL_HANDLE || !target.hasValidContent) return;
 
@@ -3686,6 +3746,14 @@ void VkRenderer::present(const VkTarget& target, int vpX, int vpY, int vpW, int 
 
         vkCmdBindPipeline(mCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, mPresentPipeline);
         vkCmdBindDescriptorSets(mCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, mPresentPipelineLayout, 0, 1, &presentSet, 0, nullptr);
+        const float presentParams[4] = {
+            target.width > 0 ? 1.0f / (float)target.width : 1.0f,
+            target.height > 0 ? 1.0f / (float)target.height : 1.0f,
+            (float)std::max(0, std::min(12, antialiasingLevel)),
+            0.0f
+        };
+        vkCmdPushConstants(mCommandBuffer, mPresentPipelineLayout,
+                           VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(presentParams), presentParams);
 
         // Draw procedural fullscreen quad (3 vertices)
         vkCmdDraw(mCommandBuffer, 3, 1, 0, 0);

@@ -10,6 +10,9 @@
 #include "Game/System/SaveDataHandleSequence.hpp"
 #include "Game/System/ScenarioDataParser.hpp"
 #include "Game/System/SysConfigFile.hpp"
+
+// Achievements: lives lost and the story ending.
+extern "C" void port_mobile_achievement_event(const char* kind, const char* a, const char* b, int n);
 #include "Game/System/UserFile.hpp"
 #include "Game/Util/SingletonHolder.hpp"
 #include <cstdio>
@@ -160,6 +163,9 @@ namespace GameDataFunction {
     }
 
     void incPlayerMissNum() {
+#if defined(__ANDROID__)
+        port_mobile_achievement_event("death", nullptr, nullptr, 0);
+#endif
         getCurrentGameDataHolder()->incPlayerMissNum();
     }
 
@@ -318,6 +324,9 @@ namespace GameDataFunction {
     }
 
     void onCompleteEndingCurrentPlayer() {
+#if defined(__ANDROID__)
+        port_mobile_achievement_event("ending", nullptr, nullptr, 0);
+#endif
         ::getSaveDataHandleSequence()->getCurrentUserFile()->onCompleteEndingCurrentPlayer();
     }
 

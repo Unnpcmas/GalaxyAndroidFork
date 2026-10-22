@@ -178,7 +178,8 @@ public:
     bool render(VkTarget& target, const EyeView* eye, VkTarget* hud, HudMode hudMode = HudMode::Inline);
     uint64_t frameNumber() const { return mFrameNumber; }
     bool hasFrame() const { return mCurrentFrame != nullptr; }
-    void present(const VkTarget& target, int vpX, int vpY, int vpW, int vpH);
+    void present(const VkTarget& target, int vpX, int vpY, int vpW, int vpH,
+                 int antialiasingLevel = 0);
 
     void onWindowResized(ANativeWindow* window);
 

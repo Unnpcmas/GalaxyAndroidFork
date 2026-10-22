@@ -12,6 +12,7 @@
 #include "Game/Util/MutexHolder.hpp"
 #include "Game/Util/NerveUtil.hpp"
 #include "Game/Util/SceneUtil.hpp"
+#include "port/port.h"
 #include "Game/Util/ScreenUtil.hpp"
 #include "Game/Util/StarPointerUtil.hpp"
 #include "Game/Util/SystemUtil.hpp"
@@ -224,6 +225,21 @@ bool ScenarioSelectScene::trySetCurrentScenarioNo() const {
             GalaxyStatusAccessor accessor = MR::makeCurrentGalaxyStatusAccessor();
             if (accessor.isHiddenStar(scenarioNo)) {
                 placedNo = MR::getPlacedHiddenStarScenarioNo(MR::getCurrentStageName(), scenarioNo);
+            } else {
+                // Randomizer: the plain missions of a galaxy (no comet, no hidden star, counted
+                // from 1) are shuffled; the star is still recorded under the picked mission.
+                s32 normalCount = 0;
+                const s32 scenarioNum = accessor.getScenarioNum();
+                for (s32 i = 1; i <= scenarioNum; i++) {
+                    const char* pComet = accessor.getCometName(i);
+                    if ((pComet != nullptr && pComet[0] != '\0') || accessor.isHiddenStar(i)) {
+                        break;
+                    }
+
+                    normalCount = i;
+                }
+
+                placedNo = port_rando_scenario(MR::getCurrentStageName(), scenarioNo, normalCount);
             }
 
             MR::setCurrentScenarioNo(placedNo, scenarioNo);

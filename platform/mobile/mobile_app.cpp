@@ -11,6 +11,7 @@
 #include <android_native_app_glue.h>
 #include <jni.h>
 #include <dirent.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,16 +22,23 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <map>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "gx/gl_renderer.h"
 #include "gx/vk_renderer.h"
 #include "gx/vk_shadergen.h"
+#include "dvd/mod_manager.h"
 #include "mobile_ui.h"
+#include "freecam.h"
 #include "port/compat.h"
 #include "port/input.h"
 #include "port/port.h"
+#include "port/randomizer.h"
 #include <android/sensor.h>
 
 #define LOGI(...) port_log("INFO PetariVR: " __VA_ARGS__)
@@ -43,6 +51,137 @@ extern "C" void port_audio_pause(void);
 extern "C" void port_audio_resume(void);
 extern std::atomic<uint64_t> gPresentedFrames;
 
+// ---- Freeze watchdog (read-only diagnostics) --------------------------------
+// If no frame is presented for several seconds while the app is in the foreground,
+// log what every thread is doing: a thread parked in a futex wait points to a
+// deadlock, a thread burning CPU in state R points to an endless loop.
+static std::atomic<bool> sAppPaused{false};
+
+struct WatchThread {
+    int tid;
+    char comm[20];
+    char state;
+    unsigned long cpu;
+};
+
+static int watchSnapThreads(WatchThread* out, int maxThreads) {
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return 0;
+    int n = 0;
+    while (dirent* e = readdir(d)) {
+        const int tid = atoi(e->d_name);
+        if (tid <= 0 || n >= maxThreads) continue;
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        char buf[512];
+        const size_t len = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[len] = 0;
+        char* open = strchr(buf, '(');
+        char* close = strrchr(buf, ')');
+        if (!open || !close || close < open) continue;
+        WatchThread& t = out[n];
+        t.tid = tid;
+        size_t cl = (size_t)(close - open - 1);
+        if (cl > sizeof(t.comm) - 1) cl = sizeof(t.comm) - 1;
+        memcpy(t.comm, open + 1, cl);
+        t.comm[cl] = 0;
+        char state = '?';
+        unsigned long ut = 0, st = 0;
+        if (sscanf(close + 2, "%c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &state, &ut, &st) == 3) {
+            t.state = state;
+            t.cpu = ut + st;
+            n++;
+        }
+    }
+    closedir(d);
+    return n;
+}
+
+static void watchReadProc(int tid, const char* file, char* out, size_t outSize) {
+    out[0] = 0;
+    char path[80];
+    snprintf(path, sizeof(path), "/proc/self/task/%d/%s", tid, file);
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    const size_t len = fread(out, 1, outSize - 1, f);
+    fclose(f);
+    out[len] = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (out[i] == '\n') out[i] = 0;
+    }
+}
+
+extern "C" void port_debug_dump_threads(void);
+extern "C" const char* port_crash_scene(void);
+
+static void watchReport(int stalledSec, uint64_t frames) {
+    static WatchThread a[160];
+    static WatchThread b[160];
+    const int na = watchSnapThreads(a, 160);
+    usleep(1000 * 1000);
+    const int nb = watchSnapThreads(b, 160);
+    port_log("ERROR watchdog: no frame presented for %d s (frames=%llu, scene=%s, %d threads)", stalledSec,
+             (unsigned long long)frames, port_crash_scene(), nb);
+    for (int i = 0; i < nb; i++) {
+        unsigned long before = b[i].cpu;
+        for (int j = 0; j < na; j++) {
+            if (a[j].tid == b[i].tid) {
+                before = a[j].cpu;
+                break;
+            }
+        }
+        char sys[96];
+        char wch[48];
+        watchReadProc(b[i].tid, "syscall", sys, sizeof(sys));
+        watchReadProc(b[i].tid, "wchan", wch, sizeof(wch));
+        port_log("watchdog: thread %d '%s' state=%c cpu+%lu ticks/s syscall=[%s] wchan=[%s]", b[i].tid, b[i].comm,
+                 b[i].state, b[i].cpu - before, sys, wch);
+    }
+    // What every emulated game thread is waiting on, with its native backtrace.
+    static bool dumped = false;
+    if (!dumped) {
+        dumped = true;
+        port_debug_dump_threads();
+    }
+}
+
+static void freezeWatchdogMain() {
+    uint64_t last = gPresentedFrames.load();
+    int stalled = 0;
+    int reports = 0;
+    for (;;) {
+        sleep(1);
+        if (sAppPaused.load()) {
+            stalled = 0;
+            reports = 0;
+            last = gPresentedFrames.load();
+            continue;
+        }
+        const uint64_t now = gPresentedFrames.load();
+        if (now != last) {
+            if (reports > 0) port_log("watchdog: frames flowing again after %d s", stalled);
+            last = now;
+            stalled = 0;
+            reports = 0;
+            continue;
+        }
+        stalled++;
+        if (reports < 3 && (stalled == 8 || stalled == 30 || stalled == 90)) {
+            reports++;
+            watchReport(stalled, now);
+        }
+    }
+}
+
+static void startFreezeWatchdog() {
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    std::thread(freezeWatchdogMain).detach();
+}
+
 namespace {
 
 struct MobileApp {
@@ -51,6 +190,12 @@ struct MobileApp {
     EGLSurface surface = EGL_NO_SURFACE;
     EGLContext context = EGL_NO_CONTEXT;
     EGLConfig config = nullptr;
+    GLuint fxaaProgram = 0;
+    GLuint fxaaVao = 0;
+    GLint fxaaImageLocation = -1;
+    GLint fxaaTexelLocation = -1;
+    GLint fxaaLevelLocation = -1;
+    int fxaaInitState = 0; // 0 = not tried, 1 = ready, -1 = unavailable for this EGL context
 
     bool windowReady = false;
     bool eglReady = false;
@@ -251,6 +396,29 @@ static void initSensors(android_app* app) {
     }
 }
 
+// Phone-motion camera (Wii style).  The game's camera orbit is a rate control
+// (stick 1.0 = 1.2 rad/s of yaw, 0.9 rad/s of pitch, times the camera
+// sensitivity), so the phone's own angular velocity maps 1:1: turn the phone
+// 90 degrees and the camera turns 90 degrees.  The gyro is integrated between
+// frames (no sample aliasing), its bias is tracked while the phone rests, and
+// the result is pre-distorted to undo the game's own stick shaping.
+static double sGyroAccYaw = 0.0, sGyroAccPitch = 0.0, sGyroAccDt = 0.0;  // rad, rad, s since the last frame
+static int64_t sGyroLastEventNs = 0;
+static float sGyroBiasX = 0.0f, sGyroBiasY = 0.0f;
+static float sLandscapeSign = 1.0f;     // +1 landscape (top to the left), -1 reverse landscape
+static float sGyroStickX = 0.0f, sGyroStickY = 0.0f;
+static int64_t sGyroCamNs = 0;
+static bool sCamInjected = false;  // we are currently driving pad.rightStick
+
+static float gyroToStick(float rate, float rateAtFullStick) {
+    // rate (rad/s the camera should turn) -> stick value the game turns into that rate.
+    const float t = std::min(1.0f, fabsf(rate) / rateAtFullStick);
+    if (t <= 0.0f) return 0.0f;
+    const float dz = 0.04f;                      // the game's own dead zone
+    const float v = dz + (1.0f - dz) * powf(t, 1.25f);  // inverse of its pow(., 0.8) shaping
+    return rate < 0 ? -v : v;
+}
+
 static void pollSensors(MobileApp& a) {
     if (!sSensorQueue) return;
     if (!sSensorsActive) {
@@ -261,6 +429,38 @@ static void pollSensors(MobileApp& a) {
     while (ASensorEventQueue_getEvents(sSensorQueue, &event, 1) > 0) {
         if (!sSensorsActive) continue;
         if (event.type == ASENSOR_TYPE_GYROSCOPE) {
+            {
+                const auto& cs = mobile_ui::UIOverlay::get().settings();
+                if (cs.gyroCamera) {
+                    const int64_t ts = event.timestamp;
+                    double dt = sGyroLastEventNs ? (double)(ts - sGyroLastEventNs) * 1e-9 : 0.0;
+                    sGyroLastEventNs = ts;
+                    if (dt <= 0.0 || dt > 0.1) dt = 0.0;
+                    float wx = event.vector.x;  // rad/s about the device axes
+                    float wy = event.vector.y;
+                    // Bias: while the phone is (almost) still, follow the sensor's offset.
+                    if (fabsf(wx - sGyroBiasX) < 0.02f && fabsf(wy - sGyroBiasY) < 0.02f) {
+                        sGyroBiasX += (wx - sGyroBiasX) * 0.003f;
+                        sGyroBiasY += (wy - sGyroBiasY) * 0.003f;
+                    }
+                    wx -= sGyroBiasX;
+                    wy -= sGyroBiasY;
+                    // In landscape the screen's up axis is the device X axis and its
+                    // right axis is the device -Y axis; sLandscapeSign flips both for
+                    // the reversed landscape.  yaw > 0: turn right, pitch > 0: look up.
+                    float yaw = -sLandscapeSign * wx;
+                    float pitch = sLandscapeSign * wy;
+                    if (cs.gyroInvertX) yaw = -yaw;
+                    if (cs.gyroInvertY) pitch = -pitch;
+                    const float dz = 0.012f;  // rad/s (under 1 deg/s): sensor noise
+                    if (fabsf(yaw) < dz) yaw = 0.0f;
+                    if (fabsf(pitch) < dz) pitch = 0.0f;
+                    sGyroAccYaw += (double)yaw * dt;
+                    sGyroAccPitch += (double)pitch * dt;
+                    sGyroAccDt += dt;
+                    sGyroCamNs = port_host_time_ns();
+                }
+            }
             if (mobile_ui::UIOverlay::get().settings().gyroAiming) {
                 // Android Landscape coordinate conversion:
                 float rotH = event.vector.x - event.vector.z * 0.35f;
@@ -284,6 +484,8 @@ static void pollSensors(MobileApp& a) {
             }
         } else if (event.type == ASENSOR_TYPE_ACCELEROMETER) {
             // Compute phone tilt/roll for motion steering (Ray Surfing, Star Ball)
+            if (event.acceleration.x > 4.0f) sLandscapeSign = 1.0f;
+            else if (event.acceleration.x < -4.0f) sLandscapeSign = -1.0f;
             float rawRoll = event.acceleration.x / 9.81f;
             float rawPitch = (event.acceleration.y - 4.9f) / 9.81f;
             rawRoll = std::max(-1.0f, std::min(1.0f, rawRoll));
@@ -525,6 +727,12 @@ bool initEgl(MobileApp& a) {
         return false;
     }
 
+    a.fxaaProgram = 0;
+    a.fxaaVao = 0;
+    a.fxaaImageLocation = -1;
+    a.fxaaTexelLocation = -1;
+    a.fxaaLevelLocation = -1;
+    a.fxaaInitState = 0;
     a.eglReady = true;
     return true;
 }
@@ -624,16 +832,18 @@ bool createSurface(MobileApp& a) {
     enforceLandscapeOrientation(a);
     eglSwapInterval(a.display, 1);
 
-    LOGI("Window surface ready: %dx%d (GL: %s)", a.screenWidth, a.screenHeight, (const char*)glGetString(GL_RENDERER));
     // OpenGL ES is what is running here: either the user asked for it or the
     // Vulkan device/driver turned out to be unusable.
     mobile_ui::get().setActiveBackend(0);
 
     updateViewport(a);
-    LOGI("Viewport: x=%d, y=%d, w=%d, h=%d (fullscreen=%d screenScale=%d)",
-         a.vpX, a.vpY, a.vpW, a.vpH,
-         mobile_ui::get().settings().fullscreen ? 1 : 0,
-         mobile_ui::get().settings().screenScaleIndex);
+    {
+        static int sSurfaceCount = 0;
+        LOGI("Window surface #%d ready: %dx%d, viewport x=%d y=%d %dx%d (fullscreen=%d screenScale=%d) GL: %s",
+             ++sSurfaceCount, a.screenWidth, a.screenHeight, a.vpX, a.vpY, a.vpW, a.vpH,
+             mobile_ui::get().settings().fullscreen ? 1 : 0,
+             mobile_ui::get().settings().screenScaleIndex, (const char*)glGetString(GL_RENDERER));
+    }
 
     // Initialize renderer and render target
     gpu::Renderer& r = gpu::renderer();
@@ -641,9 +851,6 @@ bool createSurface(MobileApp& a) {
         LOGE("gpu::renderer().init() failed");
         return false;
     }
-    GLint maxTextureSize = 0;
-    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
-    LOGI("GLES capability: GL_MAX_TEXTURE_SIZE=%d", maxTextureSize);
 
     // Allocate the selected quality, stepping down only if this GPU cannot
     // create it. The selected setting is retained, and the fallback is logged.
@@ -690,8 +897,531 @@ void destroySurface(MobileApp& a) {
     a.windowReady = false;
 }
 
+static GLuint compileFxaaShader(GLenum type, const char* source) {
+    GLuint shader = glCreateShader(type);
+    if (!shader) return 0;
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    GLint compiled = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (compiled != GL_TRUE) {
+        char log[1024] = {};
+        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+        LOGE("FXAA shader compilation failed: %s", log);
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+static bool ensureFxaaProgram(MobileApp& a) {
+    if (a.fxaaInitState == 1 && glIsProgram(a.fxaaProgram) == GL_TRUE &&
+        glIsVertexArray(a.fxaaVao) == GL_TRUE) return true;
+    if (a.fxaaInitState < 0) return false;
+
+    static const char* vertexSource = R"(#version 320 es
+precision highp float;
+out vec2 v_uv;
+void main() {
+    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    v_uv = p;
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+    static const char* fragmentSource = R"(#version 320 es
+precision highp float;
+in vec2 v_uv;
+layout(location = 0) out vec4 outColor;
+uniform sampler2D u_scene;
+uniform vec2 u_texel;
+uniform int u_level;
+
+vec4 sampleScene(vec2 uv) {
+    return texture(u_scene, clamp(uv, vec2(0.0), vec2(1.0)));
+}
+
+float luma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+void main() {
+    vec4 center = sampleScene(v_uv);
+    if (u_level <= 0) {
+        outColor = center;
+        return;
+    }
+
+    float nw = luma(sampleScene(v_uv + vec2(-u_texel.x, -u_texel.y)).rgb);
+    float ne = luma(sampleScene(v_uv + vec2( u_texel.x, -u_texel.y)).rgb);
+    float sw = luma(sampleScene(v_uv + vec2(-u_texel.x,  u_texel.y)).rgb);
+    float se = luma(sampleScene(v_uv + vec2( u_texel.x,  u_texel.y)).rgb);
+    float m = luma(center.rgb);
+    float minLuma = min(m, min(min(nw, ne), min(sw, se)));
+    float maxLuma = max(m, max(max(nw, ne), max(sw, se)));
+    float quality = clamp(float(u_level) / 12.0, 0.0, 1.0);
+    float threshold = max(mix(0.125, 0.035, quality), maxLuma * mix(0.10, 0.045, quality));
+    if (maxLuma - minLuma < threshold) {
+        outColor = center;
+        return;
+    }
+
+    vec2 direction = vec2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));
+    float reduction = max((nw + ne + sw + se) * (0.25 * mix(0.125, 0.0625, quality)), 1.0 / 128.0);
+    direction = clamp(direction / (min(abs(direction.x), abs(direction.y)) + reduction),
+                      vec2(-1.0), vec2(1.0));
+    direction *= u_texel * mix(1.0, 6.0, quality);
+
+    vec3 a = 0.5 * (
+        sampleScene(v_uv + direction * (1.0 / 3.0 - 0.5)).rgb +
+        sampleScene(v_uv + direction * (2.0 / 3.0 - 0.5)).rgb);
+    vec3 b = a * 0.5 + 0.25 * (
+        sampleScene(v_uv + direction * -0.5).rgb +
+        sampleScene(v_uv + direction *  0.5).rgb);
+    float lumaB = luma(b);
+    vec3 result = (lumaB < minLuma || lumaB > maxLuma) ? a : b;
+    outColor = vec4(result, center.a);
+}
+)";
+
+    GLuint vs = compileFxaaShader(GL_VERTEX_SHADER, vertexSource);
+    GLuint fs = compileFxaaShader(GL_FRAGMENT_SHADER, fragmentSource);
+    if (!vs || !fs) {
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+        a.fxaaInitState = -1;
+        return false;
+    }
+
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    GLint linked = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE) {
+        char log[1024] = {};
+        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+        LOGE("FXAA program link failed: %s", log);
+        glDeleteProgram(program);
+        a.fxaaInitState = -1;
+        return false;
+    }
+
+    GLuint vao = 0;
+    glGenVertexArrays(1, &vao);
+    if (!vao) {
+        glDeleteProgram(program);
+        a.fxaaInitState = -1;
+        LOGE("FXAA could not allocate its fullscreen-triangle VAO");
+        return false;
+    }
+
+    a.fxaaProgram = program;
+    a.fxaaVao = vao;
+    a.fxaaImageLocation = glGetUniformLocation(program, "u_scene");
+    a.fxaaTexelLocation = glGetUniformLocation(program, "u_texel");
+    a.fxaaLevelLocation = glGetUniformLocation(program, "u_level");
+    if (a.fxaaImageLocation < 0 || a.fxaaTexelLocation < 0 || a.fxaaLevelLocation < 0) {
+        LOGE("FXAA program is missing a required uniform");
+        glDeleteVertexArrays(1, &a.fxaaVao);
+        glDeleteProgram(a.fxaaProgram);
+        a.fxaaProgram = 0;
+        a.fxaaVao = 0;
+        a.fxaaInitState = -1;
+        return false;
+    }
+    a.fxaaInitState = 1;
+    LOGI("FXAA post-process ready (quality selector supports 0..12)");
+    return true;
+}
+
+static bool presentGlesFxaa(MobileApp& a, int level) {
+    if (level <= 0 || !a.targetReady || !a.efbTarget.color ||
+        a.efbTarget.width <= 0 || a.efbTarget.height <= 0) return false;
+    if (!ensureFxaaProgram(a)) return false;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(a.vpX, a.vpY, a.vpW, a.vpH);
+    glUseProgram(a.fxaaProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, a.efbTarget.color);
+    glBindVertexArray(a.fxaaVao);
+    glUniform1i(a.fxaaImageLocation, 0);
+    glUniform2f(a.fxaaTexelLocation, 1.0f / (float)a.efbTarget.width,
+                1.0f / (float)a.efbTarget.height);
+    glUniform1i(a.fxaaLevelLocation, std::max(0, std::min(12, level)));
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    const GLenum drawError = glGetError();
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+    glViewport(0, 0, a.screenWidth, a.screenHeight);
+    if (drawError != GL_NO_ERROR) {
+        LOGW("FXAA pass failed with GL error 0x%x; using unfiltered presentation", drawError);
+        return false;
+    }
+    return true;
+}
+
+// Adaptive FXAA: when the game stays well below 60 fps (typically a GPU-bound
+// 4K target plus top FXAA, made worse by the screen recorder), the FXAA quality
+// is stepped down until the frame rate recovers, so the picture and the audio
+// (which the game mixes frame by frame) stay smooth.  It climbs back one step at
+// a time after 30 s of a steady 60 and never goes above the chosen quality.
+extern "C" void port_crash_set_context(const char* text);
+extern "C" float port_input_camera_sensitivity(void);
+extern "C" void port_camera_reset(void);
+static std::atomic<bool> sCameraResetRequested{false};
+extern "C" void port_mobile_request_camera_reset(void) { sCameraResetRequested.store(true); }
+
+// True while the FOV is applied through the game's own 3D camera (gameplay).
+// Everywhere else (title, file select, movies) the FOV acts as a zoom of the image.
+static bool sFovThroughCamera = false;
+
+// Detailed breakdown, one line every 5 s of game time: how the frames went, what
+// the quality governor did, memory/threads and which inputs were active.  The same
+// numbers are kept in the crash report's CONTEXT line.  Every 30 s a "device" line
+// adds battery, temperature, CPU clocks and free memory (whatever Android lets an
+// app read), and a "session summary" is written when the app is paused or closed.
+extern "C" const char* port_crash_scene(void);
+extern "C" int port_audio_underruns(void);
+
+struct PerfWindow {
+    int64_t startNs = 0, lastNs = 0, sumNs = 0, maxNs = 0, minNs = 0;
+    int frames = 0, slow20 = 0, slow33 = 0, slow100 = 0;
+};
+static PerfWindow sPerf;
+static int sPerfWindowsLogged = 0;
+
+struct SessionTotals {
+    int64_t sumNs = 0, maxNs = 0, firstFrameNs = 0;
+    int64_t frames = 0, slow20 = 0, slow33 = 0, slow100 = 0, stalls = 0;
+    int adaptiveDown = 0, adaptiveUp = 0, lowMemory = 0;
+    long peakRssMb = 0;
+    int peakThreads = 0;
+    std::string worstScene;
+};
+static SessionTotals sSession;
+static int64_t sBootNs = 0;  // when the engine entry ran
+
+static void readProcStatus(long* rssMb, int* threads) {
+    *rssMb = -1;
+    *threads = -1;
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[160];
+    while (fgets(line, sizeof(line), f)) {
+        long v = 0;
+        if (sscanf(line, "VmRSS: %ld kB", &v) == 1) *rssMb = v / 1024;
+        else if (sscanf(line, "Threads: %ld", &v) == 1) *threads = (int)v;
+    }
+    fclose(f);
+}
+
+// First line of a small sysfs/procfs file, or false when Android does not let the app read it.
+static bool readSmallFile(const char* path, char* out, size_t size) {
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    const bool ok = fgets(out, (int)size, f) != nullptr;
+    fclose(f);
+    if (ok) {
+        size_t n = strlen(out);
+        while (n && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = 0;
+    }
+    return ok;
+}
+
+static void logDeviceState() {
+    char buf[96], status[48] = "n/a";
+    long capacity = -1, tempTenths = LONG_MIN, currentUa = LONG_MIN;
+    if (readSmallFile("/sys/class/power_supply/battery/capacity", buf, sizeof(buf))) capacity = atol(buf);
+    if (readSmallFile("/sys/class/power_supply/battery/temp", buf, sizeof(buf))) tempTenths = atol(buf);
+    if (readSmallFile("/sys/class/power_supply/battery/status", buf, sizeof(buf))) snprintf(status, sizeof(status), "%s", buf);
+    if (readSmallFile("/sys/class/power_supply/battery/current_now", buf, sizeof(buf))) currentUa = atol(buf);
+
+    long cpuMHz[3] = {-1, -1, -1};
+    const int cpuIds[3] = {0, 4, 9};
+    for (int i = 0; i < 3; i++) {
+        char path[96];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpuIds[i]);
+        if (readSmallFile(path, buf, sizeof(buf))) cpuMHz[i] = atol(buf) / 1000;
+    }
+
+    long hottest = LONG_MIN;
+    char hottestType[40] = "";
+    int zonesRead = 0;
+    for (int z = 0; z < 48; z++) {
+        char path[96], type[40] = "";
+        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", z);
+        if (!readSmallFile(path, buf, sizeof(buf))) continue;
+        zonesRead++;
+        long t = atol(buf);
+        if (t > 1000) t /= 100;  // millidegrees -> tenths of a degree
+        if (t > hottest) {
+            hottest = t;
+            snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/type", z);
+            readSmallFile(path, type, sizeof(type));
+            snprintf(hottestType, sizeof(hottestType), "%s", type);
+        }
+    }
+
+    long memAvailMb = -1, swapFreeMb = -1, memTotalMb = -1;
+    if (FILE* f = fopen("/proc/meminfo", "r")) {
+        char line[128];
+        long v;
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "MemAvailable: %ld kB", &v) == 1) memAvailMb = v / 1024;
+            else if (sscanf(line, "SwapFree: %ld kB", &v) == 1) swapFreeMb = v / 1024;
+            else if (sscanf(line, "MemTotal: %ld kB", &v) == 1) memTotalMb = v / 1024;
+        }
+        fclose(f);
+    }
+
+    char bat[96], thermal[96], cpu[96];
+    if (capacity >= 0) {
+        if (tempTenths != LONG_MIN) snprintf(bat, sizeof(bat), "battery %ld%% %.1fC %s", capacity, tempTenths / 10.0, status);
+        else snprintf(bat, sizeof(bat), "battery %ld%% %s", capacity, status);
+    } else {
+        snprintf(bat, sizeof(bat), "battery n/a (not readable by apps)");
+    }
+    if (currentUa != LONG_MIN) {
+        const size_t n = strlen(bat);
+        snprintf(bat + n, sizeof(bat) - n, " %ldmA", currentUa / 1000);
+    }
+    if (hottest != LONG_MIN) snprintf(thermal, sizeof(thermal), "hottest zone %.1fC (%s, %d zones readable)", hottest / 10.0, hottestType, zonesRead);
+    else snprintf(thermal, sizeof(thermal), "thermal zones n/a");
+    snprintf(cpu, sizeof(cpu), "cpu0=%ld cpu4=%ld cpu9=%ld MHz", cpuMHz[0], cpuMHz[1], cpuMHz[2]);
+    LOGI("device 30s: %s | %s | %s | memory available %ldMB of %ldMB, swap free %ldMB | audio underruns %d",
+         bat, thermal, cpu, memAvailMb, memTotalMb, swapFreeMb, port_audio_underruns());
+}
+
+static void logSessionSummary(const char* reason) {
+    const SessionTotals& t = sSession;
+    if (t.frames <= 0) {
+        LOGI("session summary (%s): no game frames were presented", reason);
+        return;
+    }
+    const double seconds = (double)t.sumNs / 1e9;
+    LOGI("session summary (%s): %.0f s of game time, %lld frames, average %.1f fps (%.2f ms); slow frames >20ms %lld (%.1f%%), >33ms %lld (%.1f%%), "
+         ">100ms %lld; worst frame %.0f ms (scene %s); FXAA governor steps down %d / up %d; audio underruns %d; low-memory warnings %d; "
+         "peak rss %ldMB, peak threads %d; last scene %s",
+         reason, seconds, (long long)t.frames, seconds > 0 ? t.frames / seconds : 0.0, (double)t.sumNs / t.frames / 1e6,
+         (long long)t.slow20, 100.0 * t.slow20 / t.frames, (long long)t.slow33, 100.0 * t.slow33 / t.frames,
+         (long long)t.slow100, t.maxNs / 1e6, t.worstScene.empty() ? "?" : t.worstScene.c_str(), t.adaptiveDown,
+         t.adaptiveUp, port_audio_underruns(), t.lowMemory, t.peakRssMb, t.peakThreads, port_crash_scene());
+}
+
+static void perfOnGameFrame(MobileApp& a, int64_t nowNs, int fxaaEffective, int fxaaCap) {
+    PerfWindow& w = sPerf;
+    if (w.startNs == 0) {
+        w.startNs = w.lastNs = nowNs;
+        sSession.firstFrameNs = nowNs;
+        LOGI("startup: first game frame %.2f s after the engine started (scene %s)",
+             sBootNs ? (double)(nowNs - sBootNs) / 1e9 : -1.0, port_crash_scene());
+        return;
+    }
+    const int64_t dt = nowNs - w.lastNs;
+    w.lastNs = nowNs;
+    if (dt <= 0) return;
+    static int64_t sLastStallLogNs = 0;
+    if (dt > 2000000000ll) {
+        // The game was paused, or the app was in the background: not a slow frame.
+        LOGI("perf: %.1f s gap between game frames (pause, background or a load); not counted as a slow frame",
+             dt / 1e9);
+        w.startNs = nowNs;
+        return;
+    }
+    w.frames++;
+    w.sumNs += dt;
+    if (dt > w.maxNs) w.maxNs = dt;
+    if (w.minNs == 0 || dt < w.minNs) w.minNs = dt;
+    if (dt > 20000000ll) w.slow20++;
+    if (dt > 33400000ll) w.slow33++;
+    if (dt > 100000000ll) w.slow100++;
+
+    SessionTotals& t = sSession;
+    t.frames++;
+    t.sumNs += dt;
+    if (dt > 20000000ll) t.slow20++;
+    if (dt > 33400000ll) t.slow33++;
+    if (dt > 100000000ll) t.slow100++;
+    if (dt > t.maxNs) { t.maxNs = dt; t.worstScene = port_crash_scene(); }
+    if (dt > 150000000ll) {
+        t.stalls++;
+        if (nowNs - sLastStallLogNs > 1000000000ll) {
+            sLastStallLogNs = nowNs;
+            long rss; int thr;
+            readProcStatus(&rss, &thr);
+            LOGW("perf: frame stall %.0f ms before frame %llu (scene %s, rss=%ldMB, threads=%d, FXAA effective=%d)",
+                 dt / 1e6, (unsigned long long)gPresentedFrames.load(), port_crash_scene(), rss, thr, fxaaEffective);
+        }
+    }
+    if (nowNs - w.startNs < 5000000000ll) return;
+
+    const mobile_ui::Settings& s = mobile_ui::get().settings();
+    long rssMb; int threads;
+    readProcStatus(&rssMb, &threads);
+    if (rssMb > t.peakRssMb) t.peakRssMb = rssMb;
+    if (threads > t.peakThreads) t.peakThreads = threads;
+    const double avgMs = w.frames ? (double)w.sumNs / w.frames / 1e6 : 0.0;
+    const double fps = w.sumNs ? w.frames * 1e9 / (double)w.sumNs : 0.0;
+    char buf[900];
+    snprintf(buf, sizeof(buf),
+             "game %.1f fps (avg %.2f ms, min %.2f, max %.2f; >20ms %d, >33ms %d, >100ms %d of %d frames) | "
+             "scene %s | FXAA chosen=%d cap=%d effective=%d adaptive=%s | res=%d speed=%dx | rss=%ldMB threads=%d | "
+             "input: leftStick=%.2f,%.2f camStick=%.2f,%.2f rightStick=%.2f,%.2f gyroCam=%s gamepad=%s | "
+             "freeCam=%s fov=%+d luigi=%s",
+             fps, avgMs, w.minNs / 1e6, w.maxNs / 1e6, w.slow20, w.slow33, w.slow100, w.frames,
+             port_crash_scene(),
+             s.antialiasingLevel, fxaaCap, fxaaEffective, s.adaptiveQuality ? "on" : "off", s.renderScale, s.gameSpeed,
+             rssMb, threads, a.pad.stickX, a.pad.stickY, mobile_ui::get().getCamStickX(), mobile_ui::get().getCamStickY(),
+             a.pad.rightStickX, a.pad.rightStickY, s.gyroCamera ? "on" : "off", a.gamepadDetected ? "yes" : "no",
+             s.modFreeCamera ? "on" : "off", s.fovOffset, s.modLuigi ? "on" : "off");
+    LOGI("perf 5s #%d: %s", ++sPerfWindowsLogged, buf);
+    port_crash_set_context(buf);
+    if (sPerfWindowsLogged % 6 == 0) logDeviceState();
+    w = PerfWindow();
+    w.startNs = w.lastNs = nowNs;
+}
+
+static int sAdaptiveCap = 12;
+static int sAdaptiveRequested = -1;
+// Anti-hunting: a climb that is followed by a drop within kAdaptHuntWindowNs proves
+// that level is too heavy for this device right now (GPU clocks back off as it
+// heats up).  The level just below it becomes a ceiling until the chosen quality
+// changes, so the load stops saw-toothing every minute or so.
+static constexpr int64_t kAdaptHuntWindowNs = 180000000000ll;
+static int sAdaptCeiling = 99;
+static int64_t sAdaptLastUpNs = 0;
+static int64_t sAdaptLastNs = 0;
+static int64_t sAdaptAccumNs = 0;
+static int sAdaptFrames = 0;
+static int sAdaptGoodFrames = 0;
+static int64_t sAdaptLastDownNs = 0;
+
+static int adaptiveFxaaLevel(int requested) {
+    if (!mobile_ui::get().settings().adaptiveQuality) {
+        sAdaptiveRequested = requested;
+        sAdaptiveCap = requested;  // switched off: exactly the chosen level, always
+        return requested;
+    }
+    if (requested != sAdaptiveRequested) {
+        sAdaptiveRequested = requested;
+        sAdaptiveCap = requested;
+        sAdaptGoodFrames = 0;
+        sAdaptCeiling = 99;
+        sAdaptLastUpNs = 0;
+    }
+    return std::min(requested, sAdaptiveCap);
+}
+
+static void adaptiveQualityOnGameFrame(int64_t nowNs) {
+    const int requested = mobile_ui::get().settings().antialiasingLevel;
+    const int64_t dt = nowNs - sAdaptLastNs;
+    sAdaptLastNs = nowNs;
+    if (!mobile_ui::get().settings().adaptiveQuality) {
+        sAdaptAccumNs = 0;
+        sAdaptFrames = 0;
+        sAdaptGoodFrames = 0;
+        return;
+    }
+    if (dt <= 0 || dt > 200000000ll || port_get_game_speed() > 1.05f || requested <= 0) {
+        sAdaptAccumNs = 0;  // a pause, menu or speed-up: not a measurement
+        sAdaptFrames = 0;
+        return;
+    }
+    sAdaptAccumNs += dt;
+    if (++sAdaptFrames < 90) return;
+    const int64_t avg = sAdaptAccumNs / sAdaptFrames;
+    const int level = adaptiveFxaaLevel(requested);
+    if (avg > 21500000ll && sAdaptiveCap > 0) {  // under ~46 fps
+        const int next = std::max(0, sAdaptiveCap - 3);
+        if (sAdaptLastUpNs != 0 && nowNs - sAdaptLastUpNs < kAdaptHuntWindowNs) {
+            sAdaptCeiling = std::min(sAdaptCeiling, std::max(0, sAdaptiveCap - 1));
+            LOGI("adaptive quality: FXAA %d did not hold, ceiling now %d", sAdaptiveCap, sAdaptCeiling);
+        }
+        LOGI("adaptive quality: %.1f fps, FXAA %d -> %d (chosen %d)", 1e9 / (double)avg, level, next, requested);
+        sAdaptiveCap = next;
+        sSession.adaptiveDown++;
+        sAdaptLastDownNs = nowNs;
+        sAdaptGoodFrames = 0;
+    } else if (avg < 17600000ll) {
+        sAdaptGoodFrames += sAdaptFrames;
+        if (sAdaptGoodFrames >= 1800 && sAdaptiveCap < std::min(requested, sAdaptCeiling) && nowNs - sAdaptLastDownNs > 30000000000ll) {
+            sAdaptiveCap++;
+            sAdaptLastUpNs = nowNs;
+            sSession.adaptiveUp++;
+            LOGI("adaptive quality: steady 60 fps, FXAA %d -> %d (chosen %d)", level, sAdaptiveCap, requested);
+            sAdaptGoodFrames = 0;
+        }
+    } else {
+        sAdaptGoodFrames = 0;
+    }
+    sAdaptAccumNs = 0;
+    sAdaptFrames = 0;
+}
+
+// Draws the last complete game image into the back buffer: FXAA when it is
+// enabled and available, otherwise a plain scaled blit. Every presentation path
+// (new frame, UI redraw, high-refresh repeat, idle hold) goes through here so a
+// repeated frame gets exactly the same filtering as a fresh one; without it the
+// picture alternated between filtered and unfiltered at refresh rates above the
+// game's 60 fps and whenever a menu forced a redraw.
+static void drawGlesGameImage(MobileApp& a) {
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, a.screenWidth, a.screenHeight);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+    updateViewport(a);
+    // FOV outside gameplay: no game camera to widen, so the whole picture is
+    // scaled about its centre (negative = closer, positive = farther).
+    const int savedVpX = a.vpX, savedVpY = a.vpY, savedVpW = a.vpW, savedVpH = a.vpH;
+    const int fovMenu = mobile_ui::get().settings().fovOffset;
+    if (fovMenu != 0 && !sFovThroughCamera && !mobile_ui::get().settings().modFreeCamera) {
+        const float kDeg = 3.14159265f / 180.0f;
+        const float z = tanf(22.5f * kDeg) / tanf((45.0f + (float)fovMenu) * 0.5f * kDeg);
+        const float cx = a.vpX + a.vpW * 0.5f, cy = a.vpY + a.vpH * 0.5f;
+        a.vpW = std::max(8, (int)lroundf(a.vpW * z));
+        a.vpH = std::max(8, (int)lroundf(a.vpH * z));
+        a.vpX = (int)lroundf(cx - a.vpW * 0.5f);
+        a.vpY = (int)lroundf(cy - a.vpH * 0.5f);
+    }
+    struct VpRestore {
+        MobileApp& m; int x, y, w, h;
+        ~VpRestore() { m.vpX = x; m.vpY = y; m.vpW = w; m.vpH = h; }
+    } vpRestore{a, savedVpX, savedVpY, savedVpW, savedVpH};
+    const int aaLevel = adaptiveFxaaLevel(mobile_ui::get().settings().antialiasingLevel);
+    if (!presentGlesFxaa(a, aaLevel)) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, a.efbTarget.fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        glBlitFramebuffer(0, 0, a.efbTarget.width, a.efbTarget.height,
+                          a.vpX, a.vpY, a.vpX + a.vpW, a.vpY + a.vpH,
+                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, a.screenWidth, a.screenHeight);
+    }
+}
+
 void presentEglSurface(MobileApp& a) {
     static EGLint lastSwapError = EGL_SUCCESS;
+    // The GX EFB alpha channel is game-internal data (including destination
+    // alpha), not transparency for Android's window compositor. Keep the
+    // full-screen NativeActivity surface opaque without changing any RGB
+    // pixels, so an RGBA EGL config cannot show content from behind the game.
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
     if (eglSwapBuffers(a.display, a.surface) != EGL_TRUE) {
         const EGLint error = eglGetError();
         if (error != lastSwapError) {
@@ -1234,12 +1964,15 @@ void onAppCmd(android_app* app, int32_t cmd) {
         break;
     case APP_CMD_RESUME:
         LOGI("APP_CMD_RESUME");
+        sAppPaused = false;
         mobile_ui::get().resumeAchievementSession();
         port_audio_resume();
         port_set_paused(0);
         break;
     case APP_CMD_PAUSE:
         LOGI("APP_CMD_PAUSE");
+        sAppPaused = true;
+        logSessionSummary("paused");
         // Key-up events are lost while the activity is paused, so drop every held
         // button instead of resuming with a stuck pad.
         a->physicalButtons = 0;
@@ -1254,6 +1987,7 @@ void onAppCmd(android_app* app, int32_t cmd) {
         port_set_paused(1);
         break;
     case APP_CMD_LOW_MEMORY:
+        sSession.lowMemory++;
         LOGW("APP_CMD_LOW_MEMORY: Android reported memory pressure; active render quality=%d target=%dx%d",
              a->activeRenderScale,
              a->vkReady ? a->vkTarget.width : a->efbTarget.width,
@@ -1261,6 +1995,7 @@ void onAppCmd(android_app* app, int32_t cmd) {
         break;
     case APP_CMD_DESTROY:
         LOGI("APP_CMD_DESTROY");
+        logSessionSummary("closing");
         mobile_ui::get().pauseAchievementSession();
         if (a->vkReady) {
             if (a->vkTarget.framebuffer) {
@@ -1386,6 +2121,48 @@ extern "C" int port_android_copy_to_clipboard(const char* bytes, int length) {
     return success ? 1 : 0;
 }
 
+extern "C" int port_android_choose_mod_zip(const char* modsDirectory) {
+    if (!modsDirectory || !modsDirectory[0] || !gMobile.android ||
+        !gMobile.android->activity || !gMobile.android->activity->vm ||
+        !gMobile.android->activity->clazz) {
+        return 0;
+    }
+
+    JavaVM* vm = gMobile.android->activity->vm;
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    const jint status = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (status == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) return 0;
+        attached = true;
+    } else if (status != JNI_OK || !env) {
+        return 0;
+    }
+
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    bool requested = false;
+    jclass activityClass = env->GetObjectClass(gMobile.android->activity->clazz);
+    if (activityClass) {
+        jmethodID method = env->GetStaticMethodID(
+                activityClass, "requestModsZipImport", "(Ljava/lang/String;)V");
+        if (method && !env->ExceptionCheck()) {
+            jstring directory = env->NewStringUTF(modsDirectory);
+            if (directory) {
+                env->CallStaticVoidMethod(activityClass, method, directory);
+                requested = !env->ExceptionCheck();
+                env->DeleteLocalRef(directory);
+            }
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        env->DeleteLocalRef(activityClass);
+    } else if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
+
+    if (attached) vm->DetachCurrentThread();
+    return requested ? 1 : 0;
+}
+
 static void updateWindowRefreshRate(float targetFps) {
     static float sLastAppliedFps = -1.0f;
     if (fabsf(sLastAppliedFps - targetFps) < 0.5f) return;
@@ -1418,16 +2195,93 @@ static void updateWindowRefreshRate(float targetFps) {
 
 static int64_t sLastPresentNs = 0;
 
+// The game itself runs at the console's 59.94 Hz retrace; a refresh target
+// above 60 can only repeat the last image. Repeating it re-runs FXAA, the UI
+// and the buffer swap for no new information and costs heat and battery, so it
+// is off. Set to true to get the old "repeat for high refresh" behaviour back.
+static constexpr bool kRepeatGameFramesAboveNative = false;
+
+static int64_t sLastNewGameFrameNs = 0;
+
+// Free camera (Mods tab). Returns true and fills `out` when the frame should be
+// drawn from the free camera instead of the game's own. Only used on the
+// OpenGL ES path; with the switch off this does nothing and the game renders
+// exactly as before.
+static freecam::State sFreeCam;
+static int64_t sFreeCamLastNs = 0;
+
+static bool freeCameraStep(MobileApp& a, const gpu::CameraInfo& cam, gpu::EyeView& out) {
+    const bool wanted = mobile_ui::get().settings().modFreeCamera;
+    const int fovOffset = mobile_ui::get().settings().fovOffset;
+    if (!wanted) {
+        if (sFreeCam.active) {
+            sFreeCam.active = false;
+            port_input_block_game(0);
+            LOGI("Free camera off");
+        }
+        if (fovOffset != 0 && cam.valid && mobile_ui::get().isGameplayActive()) {
+            // FOV only: the game's own view, drawn with a wider / narrower lens.
+            // With the offset at 0 none of this runs and the game renders as before.
+            for (int i = 0; i < 16; i++) out.view[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+            freecam::projection(cam.fovy + (float)fovOffset, cam.aspect, out.proj, 60.0f, 500000.0f);
+            out.eyePos[0] = out.eyePos[1] = out.eyePos[2] = 0.0f;
+            out.eyePos[3] = 1.0f;
+            return true;
+        }
+        return false;
+    }
+    if (!cam.valid) return false;  // no 3D camera in this frame (menus, movies)
+
+    const int64_t nowNs = port_host_time_ns();
+    if (!sFreeCam.active) {
+        freecam::begin(sFreeCam, cam.view);
+        port_input_block_game(1);
+        sFreeCamLastNs = nowNs;
+        LOGI("Free camera on");
+    }
+    const float dt = sFreeCamLastNs ? (float)(nowNs - sFreeCamLastNs) * 1e-9f : 0.0f;
+    sFreeCamLastNs = nowNs;
+
+    const uint32_t buttons = combinedPadButtons(a);
+    const float up = ((buttons & 0x0800u) ? 1.0f : 0.0f) - ((buttons & 0x0400u) ? 1.0f : 0.0f);  // A up, B down
+    const bool fast = (buttons & 0x2000u) != 0;                                                    // Z
+    freecam::step(sFreeCam, dt, a.pad.stickX, up, a.pad.stickY,
+                  a.pad.rightStickX, a.pad.rightStickY, fast);
+
+    freecam::eyeView(sFreeCam, cam.view, out.view);
+    freecam::projection(cam.fovy + (float)fovOffset, cam.aspect, out.proj);
+    float eyePos[3];
+    freecam::positionInGameView(sFreeCam, cam.view, eyePos);
+    out.eyePos[0] = eyePos[0];
+    out.eyePos[1] = eyePos[1];
+    out.eyePos[2] = eyePos[2];
+    out.eyePos[3] = 1.0f;
+    return true;
+}
+
+// Sleep used when no new game frame is ready. Right after a frame the next one
+// is ~16 ms away, so a coarse sleep is safe; poll finely only while one is due.
+static void idleWaitForGameFrame() {
+    const int64_t sinceNewFrameNs = port_host_time_ns() - sLastNewGameFrameNs;
+    const bool frameDueSoon = sinceNewFrameNs >= 11000000ll && sinceNewFrameNs < 100000000ll;
+    usleep(frameDueSoon ? 1000 : 3000);
+}
+
 // Frame rate limiter and pacer.
 // Enforces minimum frame spacing without burning CPU cycles in busy-wait loops.
 static void syncMobileFrameRate(int targetFps, float speed) {
     if (targetFps < 30) targetFps = 30;
     if (targetFps > 144) targetFps = 144;
     static int sCurrentRefreshRate = 0;
-    if (sCurrentRefreshRate != targetFps) {
-        sCurrentRefreshRate = targetFps;
-        updateWindowRefreshRate((float)targetFps);
-        port_set_display_refresh_rate(targetFps);
+    // A panel running above 60 Hz only helps when the game produces more than
+    // 60 new frames a second (fast-forward); otherwise it just draws more power.
+    // The caller passes 1.0 from UI-only redraws, so read the real game speed here.
+    const int panelHz = (port_get_game_speed() > 1.05f || kRepeatGameFramesAboveNative)
+        ? targetFps : std::min(targetFps, 60);
+    if (sCurrentRefreshRate != panelHz) {
+        sCurrentRefreshRate = panelHz;
+        updateWindowRefreshRate((float)panelHz);
+        port_set_display_refresh_rate(panelHz);
     }
 
     if (speed > 1.05f) {
@@ -1471,6 +2325,26 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
     }
     LOGI("Native engine entry: internal log %s",
          privateDataPath && privateDataPath[0] ? logPath : "unavailable");
+    {
+        char abi[PROP_VALUE_MAX] = {0}, hw[PROP_VALUE_MAX] = {0}, board[PROP_VALUE_MAX] = {0}, fp[PROP_VALUE_MAX] = {0};
+        __system_property_get("ro.product.cpu.abilist", abi);
+        __system_property_get("ro.hardware", hw);
+        __system_property_get("ro.product.board", board);
+        __system_property_get("ro.build.fingerprint", fp);
+        long memKb = 0;
+        if (FILE* mf = fopen("/proc/meminfo", "r")) {
+            char l[128];
+            if (fgets(l, sizeof(l), mf)) sscanf(l, "MemTotal: %ld kB", &memKb);
+            fclose(mf);
+        }
+        LOGI("System: abi=%s hardware=%s board=%s cores=%ld/%ld ram=%ldMB pid=%d", abi[0] ? abi : "?", hw[0] ? hw : "?",
+             board[0] ? board : "?", sysconf(_SC_NPROCESSORS_ONLN), sysconf(_SC_NPROCESSORS_CONF), memKb / 1024,
+             (int)getpid());
+        LOGI("System: fingerprint=%s", fp[0] ? fp : "?");
+    }
+    sBootNs = port_host_time_ns();
+    LOGI("Build: fork v37 (readable achievement notifications, RESET toggle next to the buttons; randomizer, seeds) compiled %s %s",
+         __DATE__, __TIME__);
 
     MobileApp& a = gMobile;
     a.android = app;
@@ -1485,6 +2359,7 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
 
     LOGI("==================================================");
     LOGI("GalaxyMobile: Native flat-screen mobile initialized");
+    startFreezeWatchdog();
     LOGI("==================================================");
     LOGI("Native startup log opened at %s", logPath);
 
@@ -1510,7 +2385,8 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
 
     a.pad.connected = 1;
     port_input_set(0, &a.pad);
-    port_skip_set_hold_seconds(0.0f);
+    // Hold-A skipping follows the "Saltar cinematicas" setting (off by default).
+    port_skip_set_hold_seconds(mobile_ui::get().settings().modSkipCutscenes ? 1.0f : 0.0f);
 
     mobile_ui::get().setPlusEdition(isPlus);
     LOGI("GalaxyMobile edition detected: %s (internalDataPath: %s)", isPlus ? "GalaxyMobile+" : "GalaxyMobile (Standard)", internalPath.c_str());
@@ -1632,6 +2508,65 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
             a.pad.stickY = 0.0f;
         }
 
+        // "Reset camera" button: the game's manual orbit and the free camera go
+        // back to the game's own pose.
+        if (sCameraResetRequested.exchange(false)) {
+            port_camera_reset();
+            sFreeCam.active = false;  // the free camera restarts from the game's view
+            sGyroAccYaw = sGyroAccPitch = sGyroAccDt = 0.0;
+            sGyroStickX = sGyroStickY = 0.0f;
+            LOGI("camera: reset (orbit and free camera back to the game's own pose)");
+        }
+
+        // Second on-screen joystick + phone motion drive the camera (right stick).
+        // Only touches the right stick while one of them is active, and hands it
+        // back to a physical controller untouched.
+        {
+            const auto& cs = mobile_ui::get().settings();
+            float cx = 0.0f, cy = 0.0f;
+            bool inject = false;
+            if (cs.showCamStick && !a.gamepadDetected && mobile_ui::get().getCamStickX() != 0.0f) { inject = true; }
+            if (cs.showCamStick && !a.gamepadDetected && mobile_ui::get().getCamStickY() != 0.0f) { inject = true; }
+            if (inject) {
+                cx = mobile_ui::get().getCamStickX();
+                cy = mobile_ui::get().getCamStickY();
+            }
+            if (cs.gyroCamera && !port_is_pointer_menu_navigation()) {
+                const float camSens = std::max(0.25f, std::min(2.0f, port_input_camera_sensitivity()));
+                if (sGyroAccDt > 0.003) {
+                    const float yawRate = (float)(sGyroAccYaw / sGyroAccDt);
+                    const float pitchRate = (float)(sGyroAccPitch / sGyroAccDt);
+                    sGyroAccYaw = sGyroAccPitch = sGyroAccDt = 0.0;
+                    const float gain = cs.gyroCameraSens;  // 1.0 = the camera turns as much as the phone
+                    const float tx = gyroToStick(yawRate * gain, 1.20f * camSens);
+                    const float ty = gyroToStick(pitchRate * gain, 0.90f * camSens);
+                    sGyroStickX += (tx - sGyroStickX) * 0.6f;  // light smoothing of sensor noise
+                    sGyroStickY += (ty - sGyroStickY) * 0.6f;
+                } else if (port_host_time_ns() - sGyroCamNs > 120000000ll) {
+                    sGyroStickX = sGyroStickY = 0.0f;  // the sensor went quiet: stop turning
+                }
+                if (fabsf(sGyroStickX) > 0.001f || fabsf(sGyroStickY) > 0.001f) {
+                    cx += sGyroStickX;
+                    cy += sGyroStickY;
+                    inject = true;
+                }
+            } else {
+                sGyroAccYaw = sGyroAccPitch = sGyroAccDt = 0.0;
+                sGyroStickX = sGyroStickY = 0.0f;
+            }
+            if (inject) {
+                a.pad.rightStickX = std::max(-1.0f, std::min(1.0f, cx));
+                a.pad.rightStickY = std::max(-1.0f, std::min(1.0f, cy));
+                sCamInjected = true;
+            } else if (sCamInjected) {
+                sCamInjected = false;
+                if (!a.gamepadDetected) {
+                    a.pad.rightStickX = 0.0f;
+                    a.pad.rightStickY = 0.0f;
+                }
+            }
+        }
+
         // In pointer-driven menus, the left stick and D-pad move the native
         // Star Pointer. The right stick remains camera-only everywhere.
         const int64_t pointerNowNs = port_host_time_ns();
@@ -1750,6 +2685,8 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
 
             if (newFrame) {
                 gPresentedFrames.store(vkr.frameNumber());
+                sLastNewGameFrameNs = port_host_time_ns();
+                mobile_ui::get().reportGameFramePresented();
 
                 const mobile_ui::Settings& settings = mobile_ui::get().settings();
                 const int scaleChoice = effectiveRenderScale(settings);
@@ -1790,7 +2727,8 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
                 // Present to swapchain with pillarboxing
                 updateViewport(a);
                 int64_t presentStartNs = port_host_time_ns();
-                vkr.present(a.vkTarget, a.vpX, a.vpY, a.vpW, a.vpH);
+                vkr.present(a.vkTarget, a.vpX, a.vpY, a.vpW, a.vpH,
+                            mobile_ui::get().settings().antialiasingLevel);
                 port_perf_present(port_host_time_ns() - presentStartNs);
                 mobile_ui::get().reportFramePresented();
 
@@ -1806,17 +2744,18 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
                 int64_t framePeriodNs = 1000000000ll / (effectiveFps > 0 ? effectiveFps : 60);
                 int64_t nowNs = port_host_time_ns();
 
-                bool highRefreshSlot = (targetFps > 60 && a.targetReady && vkr.hasFrame() && (nowNs - sLastPresentNs >= framePeriodNs));
+                bool highRefreshSlot = (kRepeatGameFramesAboveNative && targetFps > 60 && a.targetReady && vkr.hasFrame() && (nowNs - sLastPresentNs >= framePeriodNs));
                 bool uiRedrawNeeded = (mobile_ui::get().needsRedraw() && a.targetReady && vkr.hasFrame() &&
                                        (!a.gameBooted || port_is_paused() || mobile_ui::get().isSettingsOpen()));
 
                 if (highRefreshSlot || uiRedrawNeeded) {
                     syncMobileFrameRate(targetFps, 1.0f);
                     updateViewport(a);
-                    vkr.present(a.vkTarget, a.vpX, a.vpY, a.vpW, a.vpH);
+                    vkr.present(a.vkTarget, a.vpX, a.vpY, a.vpW, a.vpH,
+                                mobile_ui::get().settings().antialiasingLevel);
                     mobile_ui::get().reportFramePresented();
                 } else {
-                    usleep(1000);
+                    idleWaitForGameFrame();
                 }
             }
         } else {
@@ -1826,6 +2765,11 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
 
             if (newFrame) {
                 gPresentedFrames.store(r.frameNumber());
+                sLastNewGameFrameNs = port_host_time_ns();
+                adaptiveQualityOnGameFrame(sLastNewGameFrameNs);
+                perfOnGameFrame(a, sLastNewGameFrameNs, adaptiveFxaaLevel(mobile_ui::get().settings().antialiasingLevel),
+                                sAdaptiveCap);
+                mobile_ui::get().reportGameFramePresented();
                 a.loggedFrameHold = false;
 
                 // Check if offscreen target dimensions need to change (e.g. toggled fullscreen or resolution scale)
@@ -1860,8 +2804,12 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
                 if (!a.targetReady) continue;
 
                 int64_t renderStartNs = port_host_time_ns();
-                // Monoscopic rendering into offscreen target
-                r.render(a.efbTarget, nullptr, nullptr, gpu::HudMode::Inline);
+                // Monoscopic rendering into offscreen target (from the free
+                // camera when it is on, otherwise exactly the game's view).
+                gpu::EyeView freeEye;
+                const bool useFreeCam = freeCameraStep(a, r.camera(), freeEye);
+                sFovThroughCamera = useFreeCam;
+                r.render(a.efbTarget, useFreeCam ? &freeEye : nullptr, nullptr, gpu::HudMode::Inline);
 
                 // Clean GL states before clearing backbuffer and blitting
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1876,13 +2824,9 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
                 glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
                 glClear(GL_COLOR_BUFFER_BIT);
 
-                // Blit game image to viewport (pillarbox or fullscreen)
-                updateViewport(a);
-                glBindFramebuffer(GL_READ_FRAMEBUFFER, a.efbTarget.fbo);
-                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-                glBlitFramebuffer(0, 0, a.efbTarget.width, a.efbTarget.height,
-                                  a.vpX, a.vpY, a.vpX + a.vpW, a.vpY + a.vpH,
-                                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                // FXAA is an optional post-process after the selected render
+                // resolution. It leaves the target and quality preset untouched.
+                drawGlesGameImage(a);
                 a.lastCompleteFrameValid = a.targetReady;
 
                 // Render on-screen controls HUD & Settings overlay
@@ -1912,7 +2856,7 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
                 int64_t framePeriodNs = 1000000000ll / (effectiveFps > 0 ? effectiveFps : 60);
                 int64_t nowNs = port_host_time_ns();
 
-                bool highRefreshSlot = (targetFps > 60 && a.targetReady && r.hasFrame() && (nowNs - sLastPresentNs >= framePeriodNs));
+                bool highRefreshSlot = (kRepeatGameFramesAboveNative && targetFps > 60 && a.targetReady && r.hasFrame() && (nowNs - sLastPresentNs >= framePeriodNs));
                 bool uiRedrawNeeded = (mobile_ui::get().needsRedraw() &&
                                        (!a.gameBooted || port_is_paused() || mobile_ui::get().isSettingsOpen()));
 
@@ -1925,16 +2869,19 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
                     glDisable(GL_BLEND);
                     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
-                    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                    // Same background as the idle branch below: before the first
+                    // complete game frame the menu sits on the deep blue, so a UI
+                    // redraw (drawer animation, touch) must not flash it black.
+                    const bool haveGameFrame = a.targetReady && a.lastCompleteFrameValid;
+                    if (haveGameFrame) {
+                        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+                    } else {
+                        glClearColor(0.04f, 0.05f, 0.10f, 1.0f);
+                    }
                     glClear(GL_COLOR_BUFFER_BIT);
 
-                    updateViewport(a);
-                    if (a.targetReady && a.lastCompleteFrameValid) {
-                        glBindFramebuffer(GL_READ_FRAMEBUFFER, a.efbTarget.fbo);
-                        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-                        glBlitFramebuffer(0, 0, a.efbTarget.width, a.efbTarget.height,
-                                          a.vpX, a.vpY, a.vpX + a.vpW, a.vpY + a.vpH,
-                                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                    if (haveGameFrame) {
+                        drawGlesGameImage(a);
                     }
 
                     syncMobileFrameRate(targetFps, 1.0f);
@@ -1951,12 +2898,7 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
                     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
                     glClear(GL_COLOR_BUFFER_BIT);
                     if (a.targetReady && a.lastCompleteFrameValid) {
-                        updateViewport(a);
-                        glBindFramebuffer(GL_READ_FRAMEBUFFER, a.efbTarget.fbo);
-                        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-                        glBlitFramebuffer(0, 0, a.efbTarget.width, a.efbTarget.height,
-                                          a.vpX, a.vpY, a.vpX + a.vpW, a.vpY + a.vpH,
-                                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                        drawGlesGameImage(a);
                     } else {
                         glClearColor(0.04f, 0.05f, 0.10f, 1.0f);  // Galaxy deep blue before first game frame
                         glClear(GL_COLOR_BUFFER_BIT);
@@ -1965,7 +2907,7 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
                     presentEglSurface(a);
                     usleep(16000);
                 } else {
-                    usleep(1000);
+                    idleWaitForGameFrame();
                 }
             }
     }
@@ -1974,6 +2916,68 @@ extern "C" __attribute__((visibility("default"))) void port_android_main(struct 
     LOGI("GalaxyMobile exiting cleanly");
     destroySurface(a);
     _exit(0);
+}
+
+// ---- Mods log ---------------------------------------------------------------------
+// Every mod the game asks about goes through modProbe(): the first answer, every change of the
+// answer, and (per scene) how many times the game asked and how many times the answer was "on".
+static const char* const kModNames[] = {
+    "Luigi (play as Luigi)",
+    "Fly mode",
+    "Skip cutscenes",
+    "Infinite health",
+    "Infinite lives",
+    "Infinite star bits",
+    "Shield HD textures",
+    "Shield 60 FPS cutscenes",
+    "Shield controller curves",
+    "ABXY gamepad button sheets",
+    "Riivolution patches",
+    "Difficulty: one-hit KO",
+    "Difficulty: no healing",
+    "Difficulty: max health 3",
+    "Difficulty: enemy damage multiplier",
+    "Difficulty: boss damage multiplier"};
+static const int kModCount = (int)(sizeof(kModNames) / sizeof(kModNames[0]));
+static std::atomic<int> sModLast[32];
+static std::atomic<unsigned> sModAsked[32];
+static std::atomic<unsigned> sModOn[32];
+static std::atomic<unsigned> sModAskedTotal[32];
+static std::atomic<unsigned> sModOnTotal[32];
+static std::atomic<bool> sModSeen[32];
+
+static int modProbe(int idx, int value) {
+    if (idx >= 0 && idx < kModCount) {
+        sModAsked[idx]++;
+        sModAskedTotal[idx]++;
+        if (value > 1 || value == 1) {
+            sModOn[idx]++;
+            sModOnTotal[idx]++;
+        }
+        const int prev = sModLast[idx].exchange(value);
+        if (!sModSeen[idx].exchange(true)) {
+            LOGI("mods: [%02d] %s: first asked by the game, answer %d (%s)", idx, kModNames[idx], value, value > 0 ? "ON" : "off");
+        } else if (prev != value) {
+            LOGI("mods: [%02d] %s: answer changed %d -> %d (%s)", idx, kModNames[idx], prev, value, value > 0 ? "ON" : "off");
+        }
+    }
+    return value;
+}
+
+static void modsLogSceneSummary() {
+    bool any = false;
+    for (int i = 0; i < kModCount; i++) {
+        const unsigned asked = sModAsked[i].exchange(0);
+        const unsigned on = sModOn[i].exchange(0);
+        if (asked == 0) continue;
+        if (!any) {
+            LOGI("mods: ---- use in the scene that just ended ----");
+            any = true;
+        }
+        LOGI("mods: [%02d] %s: asked %u times, answered ON %u times, off %u times (since start: asked %u, ON %u)", i, kModNames[i], asked, on,
+             asked - on, sModAskedTotal[i].load(), sModOnTotal[i].load());
+    }
+    if (any) LOGI("mods: ---- end of use ----");
 }
 
 extern "C" {
@@ -1988,44 +2992,262 @@ int port_is_fullscreen_aspect(void) {
     return mobile_ui::UIOverlay::get().settings().fullscreen ? 1 : 0;
 }
 
+int port_is_force_luigi(void) {
+    return modProbe(0, mobile_ui::UIOverlay::get().settings().modLuigi ? 1 : 0);
+}
+
 int port_is_fly_mode(void) {
-    return mobile_ui::UIOverlay::get().settings().modFly ? 1 : 0;
+    return modProbe(1, mobile_ui::UIOverlay::get().settings().modFly ? 1 : 0);
 }
 
 int port_is_skip_cutscenes(void) {
-    return mobile_ui::UIOverlay::get().settings().modSkipCutscenes ? 1 : 0;
+    return modProbe(2, mobile_ui::UIOverlay::get().settings().modSkipCutscenes ? 1 : 0);
 }
 
 int port_is_infinite_health(void) {
-    return mobile_ui::UIOverlay::get().settings().modInfiniteHealth ? 1 : 0;
+    return modProbe(3, mobile_ui::UIOverlay::get().settings().modInfiniteHealth ? 1 : 0);
+}
+
+int port_difficulty_enemy_damage(void) {
+    return modProbe(14, std::max(1, std::min(4, mobile_ui::UIOverlay::get().settings().diffEnemyDamage)));
+}
+
+int port_difficulty_boss_damage(void) {
+    return modProbe(15, std::max(1, std::min(4, mobile_ui::UIOverlay::get().settings().diffBossDamage)));
+}
+
+int port_difficulty_one_hit(void) {
+    return modProbe(11, mobile_ui::UIOverlay::get().settings().diffOneHit ? 1 : 0);
+}
+
+int port_difficulty_no_heal(void) {
+    return modProbe(12, mobile_ui::UIOverlay::get().settings().diffNoHeal ? 1 : 0);
+}
+
+int port_difficulty_max_health_3(void) {
+    return modProbe(13, mobile_ui::UIOverlay::get().settings().diffMaxHealth3 ? 1 : 0);
+}
+
+// ---- Randomizer ------------------------------------------------------------------
+static unsigned randoFlagsFromSettings(const mobile_ui::Settings& st) {
+    unsigned flags = 0;
+    if (st.randoEnabled) {
+        if (st.randoGalaxies) flags |= rando::F_GALAXIES;
+        if (st.randoStars) flags |= rando::F_STARS;
+        if (st.randoEnemies) flags |= rando::F_ENEMIES;
+        if (st.randoItems) flags |= rando::F_ITEMS;
+        if (st.randoPowerUps) flags |= rando::F_POWERUPS;
+        if (st.randoChallenge) flags |= rando::F_CHALLENGE;
+    }
+    return flags;
+}
+
+static unsigned randoSeedNumber(const mobile_ui::Settings& st) {
+    return (unsigned)std::max(0, std::min(999999, st.randoSeed));
+}
+
+// ---- Randomizer log -------------------------------------------------------------
+// Everything the randomizer decides is written to the log, in detail: the settings it reads, the
+// full tables when they change, every door / mission / object decision and, at each scene change,
+// a summary of the scene that just loaded.
+static std::string randoFlagsText(unsigned f) {
+    std::string t;
+    auto add = [&](unsigned bit, const char* n) {
+        t += n;
+        t += (f & bit) ? "=on " : "=off ";
+    };
+    add(rando::F_GALAXIES, "galaxies");
+    add(rando::F_STARS, "stars");
+    add(rando::F_ENEMIES, "enemies");
+    add(rando::F_ITEMS, "items");
+    add(rando::F_POWERUPS, "powerups");
+    add(rando::F_CHALLENGE, "challenge");
+    return t;
+}
+
+static std::mutex sRandoLogLock;
+struct RandoSceneStats {
+    unsigned checked = 0, replaced = 0, logged = 0;
+    // Host-heap containers: this struct is filled from emulated game threads and outlives every
+    // scene, so it must not be allocated inside the game's JKRHeap (see port/randomizer.h).
+    rando::HMap<rando::HString, unsigned> byName;  // "A -> B" -> times
+};
+static RandoSceneStats sRandoScene;
+static unsigned sRandoSceneNo = 0;
+static std::atomic<unsigned> sRandoDecisions{0};
+
+static void randoLogTables(rando::Engine& e, unsigned seed, unsigned flags, const char* who) {
+    LOGI("randomizer[%s]: ---- configuration ----", who);
+    LOGI("randomizer[%s]: seed %06u (engine seed 0x%016llx)", who, seed, (unsigned long long)rando::seedFromNumber(seed));
+    LOGI("randomizer[%s]: flags 0x%02x: %s", who, flags, randoFlagsText(flags).c_str());
+    if (flags & rando::F_CHALLENGE) LOGI("randomizer[%s]: challenge mode: power-ups are never swapped", who);
+    if (flags == 0) LOGI("randomizer[%s]: nothing is randomized with these settings", who);
+    const auto lines = e.describe();
+    LOGI("randomizer[%s]: %zu replacement entries in the tables", who, lines.size());
+    for (size_t i = 0; i < lines.size(); i++) LOGI("randomizer[%s]:   [%02zu] %s", who, i + 1, lines[i].c_str());
+    LOGI("randomizer[%s]: ---- end of configuration ----", who);
+}
+
+// Galaxy doors and missions are decided by one call each, so they follow the live settings.
+static rando::Engine& randoEngine() {
+    static rando::Engine engine;
+    static bool logged = false;
+    static unsigned lastSeed = 0, lastFlags = 0;
+    const auto& st = mobile_ui::UIOverlay::get().settings();
+    const unsigned seed = randoSeedNumber(st);
+    const unsigned flags = randoFlagsFromSettings(st);
+    engine.configure(rando::seedFromNumber(seed), flags);
+    std::lock_guard<std::mutex> lock(sRandoLogLock);
+    if (!logged || seed != lastSeed || flags != lastFlags) {
+        if (logged) LOGI("randomizer[doors]: settings changed: seed %06u -> %06u, flags 0x%02x -> 0x%02x", lastSeed, seed, lastFlags, flags);
+        logged = true;
+        lastSeed = seed;
+        lastFlags = flags;
+        randoLogTables(engine, seed, flags, "doors");
+    }
+    return engine;
+}
+
+// Objects are mounted and created in two steps while a scene loads, so they use a snapshot taken
+// when the scene change starts: changing the settings in the middle of a load cannot mix two
+// configurations (which would mount one object's files and create another).
+static std::mutex sRandoCommitLock;
+static bool sRandoCommitted = false;
+static unsigned sRandoCommitSeed = 0;
+static unsigned sRandoCommitFlags = 0;
+
+static rando::Engine& randoObjectEngine() {
+    static rando::Engine engine;
+    static bool logged = false;
+    static unsigned lastSeed = 0, lastFlags = 0;
+    std::lock_guard<std::mutex> lock(sRandoCommitLock);
+    if (!sRandoCommitted) {
+        const auto& st = mobile_ui::UIOverlay::get().settings();
+        sRandoCommitSeed = randoSeedNumber(st);
+        sRandoCommitFlags = randoFlagsFromSettings(st);
+        sRandoCommitted = true;
+        LOGI("randomizer[objects]: no snapshot yet, taking one now (seed %06u, flags 0x%02x)", sRandoCommitSeed, sRandoCommitFlags);
+    }
+    engine.configure(rando::seedFromNumber(sRandoCommitSeed), sRandoCommitFlags);
+    if (!logged || sRandoCommitSeed != lastSeed || sRandoCommitFlags != lastFlags) {
+        logged = true;
+        lastSeed = sRandoCommitSeed;
+        lastFlags = sRandoCommitFlags;
+        randoLogTables(engine, sRandoCommitSeed, sRandoCommitFlags, "objects");
+    }
+    return engine;
+}
+
+static void randoLogSceneSummary() {
+    std::lock_guard<std::mutex> lock(sRandoLogLock);
+    if (sRandoScene.checked == 0 && sRandoScene.replaced == 0) return;
+    LOGI("randomizer[scene %u]: summary: %u object names checked, %u replaced, %u replacement lines logged", sRandoSceneNo,
+         sRandoScene.checked, sRandoScene.replaced, sRandoScene.logged);
+    for (const auto& kv : sRandoScene.byName) {
+        LOGI("randomizer[scene %u]:   %s x%u", sRandoSceneNo, kv.first.c_str(), kv.second);
+    }
+    sRandoScene = RandoSceneStats();
+}
+
+void port_rando_commit(void) {
+    modsLogSceneSummary();
+    randoLogSceneSummary();
+    const auto& st = mobile_ui::UIOverlay::get().settings();
+    unsigned seed, flags;
+    {
+        std::lock_guard<std::mutex> lock(sRandoCommitLock);
+        seed = randoSeedNumber(st);
+        flags = randoFlagsFromSettings(st);
+        if (!sRandoCommitted || seed != sRandoCommitSeed || flags != sRandoCommitFlags) {
+            LOGI("randomizer[commit]: objects for the next scene change from seed %06u/0x%02x to seed %06u/0x%02x", sRandoCommitSeed,
+                 sRandoCommitFlags, seed, flags);
+        } else {
+            LOGI("randomizer[commit]: objects for the next scene keep seed %06u, flags 0x%02x (%s)", seed, flags, randoFlagsText(flags).c_str());
+        }
+        sRandoCommitSeed = seed;
+        sRandoCommitFlags = flags;
+        sRandoCommitted = true;
+    }
+    std::lock_guard<std::mutex> lock(sRandoLogLock);
+    sRandoSceneNo++;
+}
+
+int port_rando_active(void) {
+    return randoEngine().active() ? 1 : 0;
+}
+
+const char* port_rando_galaxy(const char* stage) {
+    const char* out = randoEngine().galaxy(stage);
+    const int n = (int)(++sRandoDecisions);
+    if (out && stage && strcmp(out, stage) != 0) {
+        LOGI("randomizer[door #%d]: %s -> %s (seed %06d): the galaxy door loads %s", n, stage, out,
+             mobile_ui::UIOverlay::get().settings().randoSeed, out);
+    } else {
+        LOGI("randomizer[door #%d]: %s is not changed (not in the pool, or galaxies are off)", n, stage ? stage : "(null)");
+    }
+    return out;
+}
+
+int port_rando_scenario(const char* stage, int selected, int normalCount) {
+    auto& e = randoEngine();
+    const int out = e.scenario(stage, selected, normalCount);
+    const int n = (int)(++sRandoDecisions);
+    if (out != selected) {
+        std::string perm;
+        for (int i = 1; i <= normalCount; i++) perm += std::to_string(i) + "->" + std::to_string(e.scenario(stage, i, normalCount)) + " ";
+        LOGI("randomizer[mission #%d]: %s: picked mission %d loads mission %d (%d normal missions; full table: %s)", n,
+             stage ? stage : "?", selected, out, normalCount, perm.c_str());
+    } else {
+        LOGI("randomizer[mission #%d]: %s: picked mission %d is not changed (%d normal missions; stars %s, in pool %d)", n,
+             stage ? stage : "?", selected, normalCount, (e.flags() & rando::F_STARS) ? "on" : "off", rando::inGalaxyPool(stage) ? 1 : 0);
+    }
+    return out;
+}
+
+const char* port_rando_object(const char* name) {
+    const char* out = randoObjectEngine().object(name);
+    std::lock_guard<std::mutex> lock(sRandoLogLock);
+    sRandoScene.checked++;
+    if (out && name && strcmp(out, name) != 0) {
+        sRandoScene.replaced++;
+        rando::HString key(name);
+        key += " -> ";
+        key += out;
+        sRandoScene.byName[key]++;
+        if (sRandoScene.logged < 300) {
+            sRandoScene.logged++;
+            LOGI("randomizer[scene %u]: object #%u %s is replaced by %s", sRandoSceneNo, sRandoScene.replaced, name, out);
+        }
+    }
+    return out;
 }
 
 int port_is_infinite_lives(void) {
-    return mobile_ui::UIOverlay::get().settings().modInfiniteLives ? 1 : 0;
+    return modProbe(4, mobile_ui::UIOverlay::get().settings().modInfiniteLives ? 1 : 0);
 }
 
 int port_is_infinite_starbits(void) {
-    return mobile_ui::UIOverlay::get().settings().modInfiniteStarBits ? 1 : 0;
+    return modProbe(5, mobile_ui::UIOverlay::get().settings().modInfiniteStarBits ? 1 : 0);
 }
 
 int port_is_shield_hd_textures(void) {
-    return mobile_ui::UIOverlay::get().settings().modShieldTextures ? 1 : 0;
+    return modProbe(6, mobile_ui::UIOverlay::get().settings().modShieldTextures ? 1 : 0);
 }
 
 int port_is_shield_cutscenes(void) {
-    return mobile_ui::UIOverlay::get().settings().modShieldCutscenes ? 1 : 0;
+    return modProbe(7, mobile_ui::UIOverlay::get().settings().modShieldCutscenes ? 1 : 0);
 }
 
 int port_is_shield_controls(void) {
-    return mobile_ui::UIOverlay::get().settings().modShieldControls ? 1 : 0;
+    return modProbe(8, mobile_ui::UIOverlay::get().settings().modShieldControls ? 1 : 0);
 }
 
 int port_is_classic_gamepad_ui(void) {
-    return mobile_ui::UIOverlay::get().settings().modClassicGamepadUI ? 1 : 0;
+    return modProbe(9, mobile_ui::UIOverlay::get().settings().modClassicGamepadUI ? 1 : 0);
 }
 
 int port_is_riivolution_mods(void) {
-    return mobile_ui::UIOverlay::get().settings().modRiivolution ? 1 : 0;
+    return modProbe(10, mobile_ui::UIOverlay::get().settings().modRiivolution ? 1 : 0);
 }
 }
 

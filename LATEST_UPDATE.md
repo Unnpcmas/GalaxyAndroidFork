@@ -1,27 +1,27 @@
-# Última versión / Latest build
+# Última versión / Latest release
 
 ## Español
 
-- **Versión:** 0.0.32 (versionCode 37)
-- **Arquitectura:** `arm64-v8a` únicamente
-- **Compilado:** 18 de octubre de 2026, 22:49 UTC
-- **APK:** [Descargar GalaxyAndroid-v0.0.32-arm64.apk](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.32/GalaxyAndroid-v0.0.32-arm64.apk)
-- **Release:** [Galaxy Android v0.0.32](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/tag/0.0.32)
-- **Código fuente ZIP:** [descargar proyecto completo](https://github.com/Unnpcmas/GalaxyAndroidFork/archive/refs/heads/main.zip)
-- **Explorar archivos:** [árbol del proyecto](https://github.com/Unnpcmas/GalaxyAndroidFork/tree/main)
-- **SHA-256 del APK:** `7e1369f52f3db216afafcca83501ad1e770abae9b62fb7dda26badb3f525641b`
+- **Versión:** 0.0.38 · **versionCode:** 43
+- **Arquitectura:** `arm64-v8a` únicamente · **Android mínimo:** 11 (API 30)
+- **Publicado:** 22 de octubre de 2026
+- **APK:** [GalaxyAndroid-v0.0.38-arm64.apk](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.38/GalaxyAndroid-v0.0.38-arm64.apk)
+- **Código fuente completo:** [Galaxy-Android-Source-0.0.38.zip](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.38/Galaxy-Android-Source-0.0.38.zip)
+- **Release:** [Galaxy Android 0.0.38](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/tag/0.0.38)
+- **Árbol del proyecto:** [código fuente](https://github.com/Unnpcmas/GalaxyAndroidFork/tree/main)
+- **SHA-256 del APK:** `93cf4851c5a08d5693d7890d6dfc478257da3f7a140d46dd15e896de8cc36d20`
 
-La carpeta `downloads/` contiene solo este APK. El resto del repositorio incluye el código fuente y las herramientas del proyecto. No se incluyen ROM, datos del juego, partidas, APKs anteriores ni claves de firma. La compilación no se ha validado aquí en todos los modelos de teléfono.
+El mantenedor confirmó que el juego inicia en un Samsung Galaxy S25 FE; la compatibilidad puede variar en otros dispositivos. Instala el APK sobre la versión anterior sin desinstalar y conserva una copia de tus partidas antes de actualizar. El proyecto no incluye ROM, datos extraídos del juego, partidas ni claves de firma. Consulta las licencias y los créditos antes de reutilizar el código.
 
 ## English
 
-- **Version:** 0.0.32 (versionCode 37)
-- **Architecture:** `arm64-v8a` only
-- **Built:** October 18, 2026, 22:49 UTC
-- **APK:** [Download GalaxyAndroid-v0.0.32-arm64.apk](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.32/GalaxyAndroid-v0.0.32-arm64.apk)
-- **Release:** [Galaxy Android v0.0.32](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/tag/0.0.32)
-- **Source code ZIP:** [download the full project](https://github.com/Unnpcmas/GalaxyAndroidFork/archive/refs/heads/main.zip)
-- **Browse files:** [project source tree](https://github.com/Unnpcmas/GalaxyAndroidFork/tree/main)
-- **APK SHA-256:** `7e1369f52f3db216afafcca83501ad1e770abae9b62fb7dda26badb3f525641b`
+- **Version:** 0.0.38 · **versionCode:** 43
+- **Architecture:** `arm64-v8a` only · **Minimum Android:** 11 (API 30)
+- **Published:** October 22, 2026
+- **APK:** [GalaxyAndroid-v0.0.38-arm64.apk](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.38/GalaxyAndroid-v0.0.38-arm64.apk)
+- **Complete source code:** [Galaxy-Android-Source-0.0.38.zip](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.38/Galaxy-Android-Source-0.0.38.zip)
+- **Release:** [Galaxy Android 0.0.38](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/tag/0.0.38)
+- **Project tree:** [source code](https://github.com/Unnpcmas/GalaxyAndroidFork/tree/main)
+- **APK SHA-256:** `93cf4851c5a08d5693d7890d6dfc478257da3f7a140d46dd15e896de8cc36d20`
 
-The `downloads/` folder contains only this APK. The rest of the repository contains the project source and tools. No game dump, game data, saves, older APKs, or signing keys are included. This build has not been tested here on every phone model.
+The maintainer confirmed that the game starts on a Samsung Galaxy S25 FE; compatibility may vary on other devices. Install over the existing version without uninstalling, and keep a backup of your saves before updating. The project does not include a ROM, extracted game data, saves, or signing keys. Review licenses and credits before reusing the code.

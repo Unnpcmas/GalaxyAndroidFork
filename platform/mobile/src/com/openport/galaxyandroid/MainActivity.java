@@ -72,6 +72,7 @@ public class MainActivity extends Activity {
     private Button btnStartCooking;
     private Button btnLaunchGame;
     private Button btnResetData;
+    private Button btnBrowseGameFiles;
     private Button btnRes480;
     private Button btnRes720;
     private Button btnRes1080;
@@ -93,6 +94,7 @@ public class MainActivity extends Activity {
     private Button btnClearLog;
     private Button btnCopyStartupReport;
     private Button btnViewLicenses;
+    private Button btnViewChangelog;
 
     private String mSelectedSourcePath = "";
     private Uri mSelectedSourceUri = null;
@@ -441,6 +443,7 @@ public class MainActivity extends Activity {
         btnStartCooking = findViewById(R.id.btnStartCooking);
         btnLaunchGame = findViewById(R.id.btnLaunchGame);
         btnResetData = findViewById(R.id.btnResetData);
+        btnBrowseGameFiles = findViewById(R.id.btnBrowseGameFiles);
 
         // GPU Driver Manager
         txtGpuHardwareInfo = findViewById(R.id.txtGpuHardwareInfo);
@@ -472,6 +475,7 @@ public class MainActivity extends Activity {
         btnClearLog = findViewById(R.id.btnClearLog);
         btnCopyStartupReport = findViewById(R.id.btnCopyStartupReport);
         btnViewLicenses = findViewById(R.id.btnViewLicenses);
+        btnViewChangelog = findViewById(R.id.btnViewChangelog);
 
         txtLogOutput.setMovementMethod(new ScrollingMovementMethod());
         recordLaunchDiagnostic(getApplicationContext(), "MainActivity.onCreate");
@@ -498,6 +502,9 @@ public class MainActivity extends Activity {
         if (btnViewLicenses != null) {
             btnViewLicenses.setOnClickListener(v -> showBundledLicenses());
         }
+        if (btnViewChangelog != null) {
+            btnViewChangelog.setOnClickListener(v -> showChangelog());
+        }
 
         btnStartCooking.setOnClickListener(v -> {
             if (mSelectedSourcePath.isEmpty()) {
@@ -506,6 +513,15 @@ public class MainActivity extends Activity {
             }
             startCookingProcess();
         });
+
+        if (btnBrowseGameFiles != null) {
+            btnBrowseGameFiles.setOnClickListener(v -> {
+                Intent intent = new Intent(this, GameFilesActivity.class);
+                intent.putExtra(GameFilesActivity.EXTRA_ROOT_PATH,
+                        new File(Environment.getExternalStorageDirectory(), "GalaxyData").getAbsolutePath());
+                startActivity(intent);
+            });
+        }
 
         btnLaunchGame.setOnClickListener(v -> launchGameDirectly());
 
@@ -696,6 +712,46 @@ public class MainActivity extends Activity {
             if (txtLogOutput != null) appendLog("[Calidad] Error al guardar: " + e.getMessage());
             return false;
         }
+    }
+
+    private void showChangelog() {
+        StringBuilder text = new StringBuilder();
+        try (InputStream input = getAssets().open("changelog/CHANGELOG.es.md");
+             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[8192];
+            int count;
+            while ((count = input.read(buffer)) != -1) {
+                output.write(buffer, 0, count);
+            }
+            text.append(new String(output.toByteArray(), StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            text.append("El registro de cambios no se incluyó en esta compilación.\nError: ")
+                .append(e.getMessage());
+            Log.e(TAG, "Could not read bundled changelog", e);
+        }
+
+        TextView content = new TextView(this);
+        content.setText(text.toString());
+        content.setTextColor(getColor(R.color.text_secondary));
+        content.setTextSize(12);
+        content.setLineSpacing(3f * getResources().getDisplayMetrics().density, 1f);
+        int padding = (int) (16 * getResources().getDisplayMetrics().density + 0.5f);
+        content.setPadding(padding, padding, padding, padding);
+
+        ScrollView scrollView = new ScrollView(this);
+        int dialogHeight = Math.min(
+            (int) (getResources().getDisplayMetrics().heightPixels * 0.72f),
+            (int) (560 * getResources().getDisplayMetrics().density + 0.5f));
+        scrollView.setLayoutParams(new ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dialogHeight));
+        scrollView.addView(content, new ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        new AlertDialog.Builder(this)
+            .setTitle("Registro de cambios")
+            .setView(scrollView)
+            .setPositiveButton("Cerrar", null)
+            .show();
     }
 
     private void showBundledLicenses() {
@@ -1012,6 +1068,9 @@ public class MainActivity extends Activity {
         try {
             recordLaunchDiagnostic(this, "Starting GameActivity");
             startActivity(new Intent(this, GameActivity.class));
+            // No cross-fade: the default transition shows this launcher screen
+            // blended over the game's first frames ("images over images").
+            overridePendingTransition(0, 0);
             recordLaunchDiagnostic(this, "GameActivity startActivity returned");
         } catch (RuntimeException | LinkageError error) {
             recordLaunchDiagnostic(this, "GameActivity start failed", error);

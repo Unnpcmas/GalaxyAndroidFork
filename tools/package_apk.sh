@@ -45,7 +45,8 @@ rm -f $OUT/res.zip
 # Android runs wrap.sh (debuggable APKs only); a CR would break its #! line.
 tr -d '\r' < platform/android/wrap.sh > $OUT/apk/lib/arm64-v8a/wrap.sh
 for lib in libgame.so libmain.so libreserve.so; do
-  "$STRIP" --strip-unneeded -o $OUT/apk/lib/arm64-v8a/$lib build-android/$lib
+  if [ "$lib" = libgame.so ]; then S=--strip-debug; else S=--strip-unneeded; fi  # libgame keeps its function names for the log
+  "$STRIP" $S -o $OUT/apk/lib/arm64-v8a/$lib build-android/$lib
 done
 cp $OPENXR $OUT/apk/lib/arm64-v8a/
 

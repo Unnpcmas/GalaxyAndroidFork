@@ -10,6 +10,10 @@
 // Interrupts (alarms, VI retrace, DVD/audio completion, GPU tokens) are raised
 // by host threads and delivered on the CPU at safe points: when interrupts get
 // re-enabled, at explicit port_irq_poll() calls, and whenever the CPU idles.
+#include <cxxabi.h>
+#include <dlfcn.h>
+#include <elf.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
@@ -17,9 +21,12 @@
 #include <string.h>
 #include <time.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include "port/heap_routing.h"
 #include "port/port.h"
@@ -830,6 +837,113 @@ static void btSignal(int) {
     sBtDone.store(1);
 }
 
+
+// ---- Function names for the backtraces ---------------------------------------------
+// libgame.so keeps its symbol table (the packager only strips the debug info), so the log can
+// name the functions: the table is read from the library's own file (or from the APK when
+// the library is mapped straight out of it) the first time a dump asks.
+struct SymEntry {
+    uint64_t addr;
+    uint64_t size;
+    std::string name;
+};
+static std::vector<SymEntry> sSyms;
+static bool sSymsTried = false;
+
+static bool readAt(int fd, uint64_t off, void* dst, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        ssize_t r = pread(fd, (char*)dst + done, n - done, (off_t)(off + done));
+        if (r <= 0) return false;
+        done += (size_t)r;
+    }
+    return true;
+}
+
+static void loadSymsOnce() {
+    if (sSymsTried) return;
+    sSymsTried = true;
+    Dl_info dli;
+    if (!dladdr((void*)&loadSymsOnce, &dli) || !dli.dli_fname) {
+        port_log("symbols: dladdr failed; backtraces stay as raw offsets");
+        return;
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s", dli.dli_fname);
+    if (char* bang = strstr(path, "!/")) *bang = '\0';  // library mapped from inside the APK
+    // Where the library starts inside that file.
+    uint64_t fileBase = 0;
+    if (FILE* m = fopen("/proc/self/maps", "r")) {
+        char line[768];
+        while (fgets(line, sizeof(line), m)) {
+            unsigned long lo = 0, hi = 0, off = 0;
+            if (sscanf(line, "%lx-%lx %*s %lx", &lo, &hi, &off) == 3 && lo == (unsigned long)(uintptr_t)dli.dli_fbase) {
+                fileBase = off;
+                break;
+            }
+        }
+        fclose(m);
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        port_log("symbols: cannot open %s", path);
+        return;
+    }
+    Elf64_Ehdr eh;
+    if (!readAt(fd, fileBase, &eh, sizeof(eh)) || memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 || eh.e_shentsize != sizeof(Elf64_Shdr) ||
+        eh.e_shnum == 0 || eh.e_shnum > 200) {
+        port_log("symbols: %s has no readable ELF header at offset 0x%llx", path, (unsigned long long)fileBase);
+        close(fd);
+        return;
+    }
+    std::vector<Elf64_Shdr> sh(eh.e_shnum);
+    if (!readAt(fd, fileBase + eh.e_shoff, sh.data(), sh.size() * sizeof(Elf64_Shdr))) {
+        close(fd);
+        return;
+    }
+    for (size_t i = 0; i < sh.size(); i++) {
+        if (sh[i].sh_type != SHT_SYMTAB || sh[i].sh_link >= sh.size()) continue;
+        const Elf64_Shdr& str = sh[sh[i].sh_link];
+        if (sh[i].sh_size > (256u << 20) || str.sh_size > (256u << 20)) break;
+        std::vector<Elf64_Sym> syms(sh[i].sh_size / sizeof(Elf64_Sym));
+        std::vector<char> names(str.sh_size + 1, 0);
+        if (!readAt(fd, fileBase + sh[i].sh_offset, syms.data(), syms.size() * sizeof(Elf64_Sym)) ||
+            !readAt(fd, fileBase + str.sh_offset, names.data(), str.sh_size)) {
+            break;
+        }
+        for (const Elf64_Sym& sym : syms) {
+            if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC || sym.st_value == 0 || sym.st_name >= str.sh_size) continue;
+            sSyms.push_back({sym.st_value, sym.st_size, std::string(names.data() + sym.st_name)});
+        }
+        break;
+    }
+    close(fd);
+    std::sort(sSyms.begin(), sSyms.end(), [](const SymEntry& a, const SymEntry& b) { return a.addr < b.addr; });
+    if (sSyms.empty()) {
+        port_log("symbols: %s has no function symbol table (stripped build); backtraces stay as raw offsets", path);
+    } else {
+        port_log("symbols: %zu functions read from %s", sSyms.size(), path);
+    }
+}
+
+// "Name+0x1c" for a libgame offset, or "" when unknown.
+static std::string symbolFor(uint64_t off) {
+    loadSymsOnce();
+    if (sSyms.empty()) return "";
+    auto it = std::upper_bound(sSyms.begin(), sSyms.end(), off, [](uint64_t v, const SymEntry& e) { return v < e.addr; });
+    if (it == sSyms.begin()) return "";
+    --it;
+    if (it->size && off >= it->addr + it->size + 16) return "";
+    int status = 0;
+    char* dem = abi::__cxa_demangle(it->name.c_str(), nullptr, nullptr, &status);
+    std::string out = (status == 0 && dem) ? dem : it->name;
+    free(dem);
+    if (out.size() > 150) out.resize(150);
+    char tail[32];
+    snprintf(tail, sizeof(tail), "+0x%llx", (unsigned long long)(off - it->addr));
+    return out + tail;
+}
+
 extern "C" void port_debug_dump_threads(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -854,17 +968,19 @@ extern "C" void port_debug_dump_threads(void) {
         for (int w = 0; w < 200 && !sBtDone.load(); w++) {
             usleep(1000);
         }
-        char line[1024];
-        int n = 0;
-        for (int k = 0; k < sBtCount && n < 1000; k++) {
+        Dl_info dli;
+        const uintptr_t libBase = dladdr((void*)&port_debug_dump_threads, &dli) ? (uintptr_t)dli.dli_fbase : 0;
+        for (int k = 0; k < sBtCount && k < 24; k++) {
             uintptr_t pc = sBtPcs[k];
-            if (pc >= 0x98000000u && pc < 0xA0000000u) {
-                n += snprintf(line + n, sizeof(line) - n, " g:%lx", (unsigned long)(pc - 0x98000000u));
+            if (libBase && pc >= libBase && pc < libBase + 0x4000000u) {
+                const std::string name = symbolFor(pc - libBase);
+                port_log("  bt[%02d] libgame+%lx %s", k, (unsigned long)(pc - libBase), name.c_str());
+            } else if (pc >= 0x98000000u && pc < 0xA0000000u) {
+                port_log("  bt[%02d] g:%lx", k, (unsigned long)(pc - 0x98000000u));
             } else {
-                n += snprintf(line + n, sizeof(line) - n, " %lx", (unsigned long)pc);
+                port_log("  bt[%02d] %lx (system library)", k, (unsigned long)pc);
             }
         }
-        port_log("  bt:%s", line);
     }
 }
 

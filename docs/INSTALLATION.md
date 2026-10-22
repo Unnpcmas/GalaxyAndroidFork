@@ -50,7 +50,7 @@ With the unified **GalaxyAndroid** package, your phone extracts, decrypts, and c
    - **`.wia`** / **`.ciso`** / **`.zip`**
 
 ### Step 2: Install the Unified APK
-Download the current ARM64 build, [GalaxyAndroid-v0.0.32-arm64.apk](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.32/GalaxyAndroid-v0.0.32-arm64.apk), from this fork's [GitHub Releases](https://github.com/Unnpcmas/GalaxyAndroidFork/releases), then install it.
+Download the current ARM64 build, [GalaxyAndroid-v0.0.38-arm64.apk](https://github.com/Unnpcmas/GalaxyAndroidFork/releases/download/0.0.38/GalaxyAndroid-v0.0.38-arm64.apk), from this fork's [GitHub Releases](https://github.com/Unnpcmas/GalaxyAndroidFork/releases), then install it.
 
 ### Step 3: Launch & Setup
 1. Launch **Galaxy Android** from your app drawer.
@@ -103,7 +103,7 @@ From the project root:
 
 ### Step 5: Install & Play
 ```bash
-adb install -r downloads/GalaxyAndroid-v0.0.32-arm64.apk
+adb install -r downloads/GalaxyAndroid-v0.0.38-arm64.apk
 adb shell am start -n com.openport.galaxyandroid/.MainActivity
 ```
 
@@ -113,7 +113,7 @@ adb shell am start -n com.openport.galaxyandroid/.MainActivity
 
 ### App crashes on startup or while loading
 - Ensure you granted storage permission so the app can access `/sdcard/GalaxyData`.
-- This is a development build; version 0.0.32 does not guarantee that all device-specific startup or load crashes are fixed. Export the diagnostic log if possible and keep a separate copy of your saves before reinstalling or loading a snapshot.
+- The maintainer confirmed that version 0.0.38 launches on a Samsung Galaxy S25 FE; compatibility can vary on other devices. If it crashes, export the diagnostic log and keep a separate copy of your saves before reinstalling or loading a snapshot.
 
 ### Star Pointer moves in the wrong direction
 - Open the Controls settings and adjust **Invert X** / **Invert Y** if those options are available in your build. Gyroscope behavior varies by device.

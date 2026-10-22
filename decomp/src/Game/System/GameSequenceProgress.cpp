@@ -24,6 +24,7 @@
 #include "Game/Util/SoundUtil.hpp"
 #include "Game/Util/StarPointerUtil.hpp"
 #include "Game/Util/StringUtil.hpp"
+#include "port/port.h"
 
 namespace {
     static const s32 sTimingPlayingTicoSE = 180;
@@ -163,6 +164,13 @@ void GameSequenceProgress::requestGalaxyMove(const GalaxyMoveArgument& rMoveArg)
     mFindingLuigiEventScheduler->update(rMoveArg);
 
     GalaxyMoveArgument moveArg(rMoveArg);
+
+    // Randomizer: the galaxy door of the Astro Dome (the move that opens the mission select
+    // for a galaxy) leads to another galaxy. Comet moves and in-game moves keep their galaxy.
+    if (moveArg.mMoveType == 2 && moveArg.mScenarioNo == -1 && moveArg.mStageName != nullptr) {
+        moveArg.mStageName = port_rando_galaxy(moveArg.mStageName);
+    }
+
     mStorySequenceExecutor->moveGalaxy(&moveArg, isNerve(GET_NERVE_ANON(GameSequenceProgressResetProcessing)) || mIsCancelScenarioSelect);
 
     mGalaxyCometScheduler->syncWithFlags();

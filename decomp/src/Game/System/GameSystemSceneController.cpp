@@ -26,6 +26,8 @@
 #include <JSystem/JKernel/JKRSolidHeap.hpp>
 #include <cstdio>
 
+extern "C" void port_dsp_hold_mixer(int ms);  // platform/src/audio/ai_dsp.cpp
+
 namespace {
     AudSystemWrapper* getAudioSystemWrapper() NO_INLINE {
         return SingletonHolder< GameSystem >::get()->mObjHolder->mAudioSystem;
@@ -334,6 +336,8 @@ void GameSystemSceneController::exeWaitDrawDoneScene() {
 
 void GameSystemSceneController::exeDestroyScene() {
     if (mSpine->mStep == 0) {
+        port_dsp_hold_mixer(8000);
+        port_rando_commit();
         mIntermissionScene->setCurrentSceneControllerState("[destroy Scene: %s]", mCurrSceneControlInfo.mScene);
         MR::startFunctionAsyncExecute(MR::Functor(this, &GameSystemSceneController::destroyScene), 17, "\x83\x56\x81\x5b\x83\x93\x94\x6a\x8a\xfc");
     }
@@ -371,6 +375,7 @@ void GameSystemSceneController::exeInitializeScene() {
 
     if (MR::tryEndFunctionAsyncExecute("\x83\x56\x81\x5b\x83\x93\x8f\x89\x8a\xfa\x89\xbb")) {
         mSceneInitializeState = SceneInitializeState_End;
+        port_dsp_hold_mixer(0);
         port_log("scene: initialization completed scene=%s stage=%s",
                  mNextSceneControlInfo.mScene, mNextSceneControlInfo.mStage);
 

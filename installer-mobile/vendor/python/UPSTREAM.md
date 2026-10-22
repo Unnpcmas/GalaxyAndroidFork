@@ -9,6 +9,12 @@ SHA-256:
 
 `571e4cf4e0aee3d1ab54a52ca3d4e6845b85ec0bb327f7debfb873172f445dab`
 
+`libssl_python.so`, `libcrypto_python.so`, `libsqlite3_python.so` and the
+`_ssl`/`_hashlib`/`_sqlite3` extension modules are intentionally not shipped: the
+cooker never imports them. They are in the upstream tarball above if ever needed.
+`stdlib/pythonhome.zip` is the upstream archive passed through
+`tools/trim_pythonhome.py` (verify with `tools/verify_pythonhome.py`).
+
 The app embeds CPython locally to cook a user-selected disc image. The APK
 contains the matching ARM64 `libpython3.15.so`, its required Python runtime
 libraries, public headers used to build the JNI bridge, and the Python standard

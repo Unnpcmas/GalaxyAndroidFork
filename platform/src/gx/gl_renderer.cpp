@@ -37,6 +37,7 @@ static std::vector<GLuint> sDeleteTextures;
 
 void queueGlTextureDelete(uint32_t tex) {
     if (tex) {
+        PortHostAllocScope hostAlloc;  // may run on a game thread; the vector must not live in the game heap
         std::lock_guard<std::mutex> lock(sDeleteLock);
         sDeleteTextures.push_back(tex);
     }
@@ -143,6 +144,13 @@ struct CopyTex {
 };
 
 }  // namespace
+
+// Graphics health counters (cumulative; the 10 s GFX_DIAG block prints them).
+static std::atomic<u64> sDiagCopyReads{0}, sDiagCopyStale{0}, sDiagCopyMissing{0}, sDiagNoProgram{0};
+static std::atomic<u64> sDiagCopyWrites{0}, sDiagCopyToXfb{0}, sDiagCopyHalf{0}, sDiagCopyDepth{0}, sDiagCopyClear{0};
+static std::atomic<u64> sDiagDraws{0}, sDiagAdditive{0}, sDiagAlphaBlend{0}, sDiagOpaque{0}, sDiagHudDraws{0};
+static std::atomic<u64> sDiagNoDepthTest{0}, sDiagIndices{0}, sDiagBuiltDropped{0}, sDiagRequestsDropped{0};
+static std::atomic<u64> sDiagTexUnbound{0};
 
 static std::string sShaderCachePath;
 
@@ -292,6 +300,19 @@ void Renderer::Impl::init() {
         glBufferData(GL_UNIFORM_BUFFER, sizeof(EyeBlock), nullptr, GL_DYNAMIC_DRAW);
     }
 
+    {
+        auto str = [](GLenum n) { const char* v = (const char*)glGetString(n); return v ? v : "(null)"; };
+        port_log("gl: driver: renderer=%s | vendor=%s | version=%s | GLSL=%s",
+                 str(GL_RENDERER), str(GL_VENDOR), str(GL_VERSION), str(GL_SHADING_LANGUAGE_VERSION));
+        GLint maxTex = 0, maxRb = 0, maxAtt = 0, maxUbo = 0, maxSamples = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
+        glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &maxRb);
+        glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS, &maxAtt);
+        glGetIntegerv(GL_MAX_UNIFORM_BLOCK_SIZE, &maxUbo);
+        glGetIntegerv(GL_MAX_SAMPLES, &maxSamples);
+        port_log("gl: limits: texture=%d renderbuffer=%d colorAttachments=%d uniformBlock=%d samples=%d",
+                 maxTex, maxRb, maxAtt, maxUbo, maxSamples);
+    }
     GLint attribs = 0, vsBlocks = 0, fsBlocks = 0, blockSize = 0;
     glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &attribs);
     glGetIntegerv(GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS, &vsBlocks);
@@ -538,6 +559,7 @@ GLuint Renderer::Impl::buildProgram(const ShaderUid& uid) {
             port_log("glsrc: %s", body.substr(i, 900).c_str());
         }
     }
+    const int64_t buildStartNs = port_host_time_ns();
     GLuint vs = compileShader(GL_VERTEX_SHADER, vsrc);
     GLuint fs = compileShader(GL_FRAGMENT_SHADER, fsrc);
     if (vs && fs) {
@@ -546,8 +568,22 @@ GLuint Renderer::Impl::buildProgram(const ShaderUid& uid) {
     if (vs) glDeleteShader(vs);
     if (fs) glDeleteShader(fs);
     static std::atomic<int> built{0};
-    if ((++built % 50) == 0) {
-        port_log("gl: %d shader programs built", built.load());
+    static std::atomic<int> failed{0};
+    static std::atomic<int64_t> totalNs{0};
+    static std::atomic<int64_t> maxNs{0};
+    const int64_t dtNs = port_host_time_ns() - buildStartNs;
+    totalNs += dtNs;
+    int64_t prevMax = maxNs.load();
+    while (dtNs > prevMax && !maxNs.compare_exchange_weak(prevMax, dtNs)) {}
+    if (!prog) failed++;
+    const int n = ++built;
+    if (dtNs > 150000000) {
+        port_log("WARN gl: slow shader build #%d took %.0f ms (vs %zu B, fs %zu B)%s", n, dtNs / 1.0e6,
+                 vsrc.size(), fsrc.size(), prog ? "" : " and FAILED");
+    }
+    if ((n % 50) == 0) {
+        port_log("gl: %d shader programs built (%d failed), avg %.1f ms, slowest %.0f ms, total %.1f s",
+                 n, failed.load(), totalNs.load() / 1.0e6 / n, maxNs.load() / 1.0e6, totalNs.load() / 1.0e9);
     }
     return prog;
 }
@@ -639,6 +675,9 @@ GLuint Renderer::Impl::sampler(u32 mode0, u32 mode1, u32 levels) {
     return s;
 }
 
+// Render-time health counters for the flashing-light investigation: draws
+// skipped for lack of a shader program, and copy textures (bloom, glow,
+// reflections) read before this frame wrote them or not found at all.
 CopyTex& Renderer::Impl::copyTex(u64 key, int w, int h) {
     CopyTex& c = copies[key];
     if (c.tex && (c.w != w || c.h != h)) {
@@ -788,7 +827,9 @@ void Renderer::Impl::upload(Prepared& p, bool syncPrograms) {
     stateTex = fb.tex[2];
     vtxRecTex = fb.tex[3];
 
-    // New textures.
+    // New textures. Cumulative stats feed the periodic GFX_DIAG line.
+    static u64 sTexUploads = 0, sTexBytes = 0, sTexNs = 0, sTexMaxNs = 0, sTexBiggest = 0, sTexMipped = 0;
+    static u64 sTexWindowUploads = 0, sTexWindowBytes = 0, sTexWindowNs = 0;
     for (auto& img : f.textures) {
         if (img->glTex && img->glVersion == img->version) {
             continue;
@@ -819,6 +860,7 @@ void Renderer::Impl::upload(Prepared& p, bool syncPrograms) {
         if (!img->glTex) {
             glGenTextures(1, &img->glTex);
         }
+        const int64_t texStartNs = port_host_time_ns();
         glBindTexture(GL_TEXTURE_2D, img->glTex);
         const u32* px = img->rgba.data();
         u32 w = img->width, h = img->height;
@@ -840,6 +882,21 @@ void Renderer::Impl::upload(Prepared& p, bool syncPrograms) {
         }
         img->glVersion = img->version;
         ++successfulTextureUploads;
+        {
+            const int64_t dtNs = port_host_time_ns() - texStartNs;
+            const u64 bytes = (u64)expectedPixels * 4;
+            sTexUploads++; sTexWindowUploads++;
+            sTexBytes += bytes; sTexWindowBytes += bytes;
+            sTexNs += (u64)dtNs; sTexWindowNs += (u64)dtNs;
+            if ((u64)dtNs > sTexMaxNs) sTexMaxNs = (u64)dtNs;
+            if (bytes > sTexBiggest) sTexBiggest = bytes;
+            if (img->levels > 1) sTexMipped++;
+            if (dtNs > 20000000) {
+                port_log("WARN gfx: slow texture upload %.1f ms (%ux%u, %u levels, %.2f MB) frame=%llu",
+                         dtNs / 1.0e6, img->width, img->height, img->levels, bytes / 1048576.0,
+                         (unsigned long long)f.number);
+            }
+        }
         // Images never change once recorded, so the pixels are not needed
         // again (except by the PETARI_DUMP texture dump).
         static const bool keepPixels = debugEnv("PETARI_DUMP") != nullptr;
@@ -853,6 +910,20 @@ void Renderer::Impl::upload(Prepared& p, bool syncPrograms) {
                  (unsigned long long)f.number, f.draws, f.textures.size(),
                  changedTextureCount, successfulTextureUploads, invalidTextureCount,
                  rowH, recH, stH, vtxRecH);
+        port_log("gfx textures: total %llu uploaded (%llu with mipmaps), %.1f MB, %.0f ms spent, slowest %.1f ms, biggest %.2f MB | last window: %llu uploads, %.1f MB, %.0f ms",
+                 (unsigned long long)sTexUploads, (unsigned long long)sTexMipped, sTexBytes / 1048576.0,
+                 sTexNs / 1.0e6, sTexMaxNs / 1.0e6, sTexBiggest / 1048576.0,
+                 (unsigned long long)sTexWindowUploads, sTexWindowBytes / 1048576.0, sTexWindowNs / 1.0e6);
+        sTexWindowUploads = sTexWindowBytes = sTexWindowNs = 0;
+        {
+            auto L = [](const std::atomic<u64>& a) { return (unsigned long long)a.load(); };
+            port_log("gfx copies: %llu EFB copies written (%llu to screen, %llu half-size, %llu depth, %llu with clear) | %llu copy-texture reads: %llu from an older frame, %llu missing, %llu bound as nothing",
+                     L(sDiagCopyWrites), L(sDiagCopyToXfb), L(sDiagCopyHalf), L(sDiagCopyDepth), L(sDiagCopyClear),
+                     L(sDiagCopyReads), L(sDiagCopyStale), L(sDiagCopyMissing), L(sDiagTexUnbound));
+            port_log("gfx draws: %llu drawn (%llu opaque, %llu alpha-blended, %llu additive glow, %llu without depth test, %llu in HUD), %llu indices | skipped without a program: %llu | frames dropped: %llu prepared-unshown, %llu requests superseded",
+                     L(sDiagDraws), L(sDiagOpaque), L(sDiagAlphaBlend), L(sDiagAdditive), L(sDiagNoDepthTest),
+                     L(sDiagHudDraws), L(sDiagIndices), L(sDiagNoProgram), L(sDiagBuiltDropped), L(sDiagRequestsDropped));
+        }
         lastGfxHealthFrame = f.number;
     }
 
@@ -895,6 +966,7 @@ void Renderer::Impl::workerMain() {
         }
         std::lock_guard<std::mutex> lock(workLock);
         if (built) {
+            sDiagBuiltDropped++;  // a prepared frame the renderer never showed
             spare = std::move(built);  // superseded before the render thread took it
         }
         built = std::move(out);
@@ -921,6 +993,7 @@ void Renderer::Impl::doCopy(const Item& it, EfbTarget& src, Renderer& r, bool vr
     int sy1 = src.height - (int)lroundf(y * fy), sy0 = src.height - (int)lroundf((y + h) * fy);
 
     if (toXfb) {
+        sDiagCopyToXfb++;
         if (!vr) {
             int dw = sx1 - sx0, dh = sy1 - sy0;
             CopyTex& xfb = copyTex(kXfbCopyKey, dw, dh);
@@ -943,11 +1016,15 @@ void Renderer::Impl::doCopy(const Item& it, EfbTarget& src, Renderer& r, bool vr
         if (dw < 1) dw = 1;
         if (dh < 1) dh = 1;
         CopyTex& dst = copyTex(copyKey(copySlot, (cp[3] & 0xFFFFFF) << 5), dw, dh);
+        sDiagCopyWrites++;
+        if (half) sDiagCopyHalf++;
+        if (clear) sDiagCopyClear++;
         u32 fmt = ((ctrl >> 4) & 7) | (((ctrl >> 3) & 1) << 3);
         bool intensity = (ctrl >> 15) & 1;
         bool zcopy = (it.copyPixFmt & 7) == 3;
         int mode;
         if (zcopy) {
+            sDiagCopyDepth++;
             mode = 11;
         } else {
             switch (fmt) {
@@ -1286,11 +1363,33 @@ void Renderer::Impl::execute(EfbTarget& efb, const EyeView* eye, EfbTarget* hud,
     bool shouldLog = (this->cur->number % 1800 == 1 && this->cur->number != sLastLoggedFrame);
     if (shouldLog) {
         sLastLoggedFrame = this->cur->number;
-        port_log("execute: frame %llu, items %zu, vrEye=%d, native %ux%u", (unsigned long long)this->cur->number, items.size(), vrEye ? 1 : 0, nativeW, nativeH);
+        // One summary line per sample; the per-draw dump (PETARI_GXDUMP=1) is for
+        // developers and used to make up three quarters of every log.
+        unsigned nDraw = 0, nVr = 0, nHud = 0, nTest = 0, nCopy = 0, nXfb = 0, nMarker = 0, biggest = 0;
+        unsigned long long idxTotal = 0;
+        for (const Item& it : items) {
+            if (it.type == IT_DRAW) {
+                nDraw++;
+                if (it.useVr) nVr++;
+                if (it.hud) nHud++;
+                if (it.depthTest) nTest++;
+                idxTotal += it.idxCount;
+                if (it.idxCount > biggest) biggest = it.idxCount;
+            } else if (it.type == IT_COPY) {
+                nCopy++;
+                if ((it.copy[9] >> 14) & 1) nXfb++;
+            } else if (it.type == IT_MARKER) {
+                nMarker++;
+            }
+        }
+        port_log("gx frame %llu: items=%zu draws=%u (3D-camera=%u HUD=%u depth-tested=%u) indices=%llu biggest=%u copies=%u (to XFB %u) markers=%u | vrEye=%d native=%ux%u target=%dx%d",
+                 (unsigned long long)this->cur->number, items.size(), nDraw, nVr, nHud, nTest, idxTotal, biggest,
+                 nCopy, nXfb, nMarker, vrEye ? 1 : 0, nativeW, nativeH, cur ? cur->width : 0, cur ? cur->height : 0);
     }
+    static const bool sVerboseGxDump = getenv("PETARI_GXDUMP") != nullptr;
     int drawCount = 0;
     for (const Item& it : items) {
-        if (shouldLog) {
+        if (shouldLog && sVerboseGxDump) {
             if (it.type == IT_DRAW) {
                 drawCount++;
                 if (drawCount <= 20 || !it.hud) {
@@ -1361,9 +1460,23 @@ void Renderer::Impl::execute(EfbTarget& efb, const EyeView* eye, EfbTarget* hud,
             prog = program(this->cur->uids[it.uid], true);
         }
         if (!prog || !it.idxCount) {
+            if (!prog && it.idxCount) {
+                u64 n = ++sDiagNoProgram;
+                if (n <= 5 || (n % 500) == 0) {
+                    port_log("WARN gfx: draw skipped, its shader program is not ready (frame %llu, skipped so far %llu)",
+                             (unsigned long long)this->cur->number, (unsigned long long)n);
+                }
+            }
             continue;
         }
         EfbTarget& t = *cur;
+        sDiagDraws++;
+        sDiagIndices += it.idxCount;
+        if (inHudSection) sDiagHudDraws++;
+        if (!it.depthTest) sDiagNoDepthTest++;
+        if (!it.blend) sDiagOpaque++;
+        else if (it.dstRGB == GL_ONE) sDiagAdditive++;
+        else sDiagAlphaBlend++;
         float fx = (float)t.width / (float)nativeW, fy = (float)t.height / (float)nativeH;
         if (it.useVr && vrEye) {
             setViewport(0, 0, t.width, t.height);
@@ -1452,6 +1565,21 @@ void Renderer::Impl::execute(EfbTarget& efb, const EyeView* eye, EfbTarget* hud,
                     cit = copies.find(copyKey(0, addr));
                 }
                 GLuint ctex = (cit != copies.end()) ? cit->second.tex : 0;
+                sDiagCopyReads++;
+                if (cit == copies.end()) {
+                    u64 n = ++sDiagCopyMissing;
+                    if (n <= 8 || (n % 500) == 0) {
+                        port_log("WARN gfx: draw samples an EFB copy that does not exist (addr 0x%x, slot %u, frame %llu, seen %llu times)",
+                                 addr, copySlot, (unsigned long long)this->cur->number, (unsigned long long)n);
+                    }
+                } else if (cit->second.frame != this->cur->number) {
+                    u64 n = ++sDiagCopyStale;
+                    if (n <= 8 || (n % 500) == 0) {
+                        port_log("WARN gfx: draw samples an EFB copy from an older frame (addr 0x%x, written in frame %llu, now %llu, seen %llu times); this shows as flashing glow/bloom",
+                                 addr, (unsigned long long)cit->second.frame, (unsigned long long)this->cur->number, (unsigned long long)n);
+                    }
+                }
+                if (!ctex) sDiagTexUnbound++;
                 bindTexture(u, ctex, sampler(it.texMode0[u], it.texMode1[u], 1));
             } else if (tr < textures.size()) {
                 bindTexture(u, textures[tr]->glTex, sampler(it.texMode0[u], it.texMode1[u], textures[tr]->levels));
@@ -1605,6 +1733,7 @@ void Renderer::Impl::requestLatest() {
     auto latest = frameQueue().latest();
     if (latest && latest->number != lastRequested) {
         lastRequested = latest->number;
+        if (wanted) sDiagRequestsDropped++;  // the worker was still busy with an older frame
         wanted = std::move(latest);
         workCv.notify_one();
     }

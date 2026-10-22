@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <vector>
@@ -22,6 +23,8 @@ std::mutex sLock;  // the stream, the resampler and the WAV file
 AAudioStream* sStream = nullptr;
 bool sOpenFailed = false;
 std::atomic<bool> sDisconnected{false};
+std::atomic<int> sLastStreamError{0};      // set by AAudio's error callback, logged from the producer thread
+std::atomic<uint64_t> sTotalCallbackFrames{0};
 int32_t sDeviceRate = 0;
 std::vector<s16> sLR, sOut;
 
@@ -169,6 +172,7 @@ aaudio_data_callback_result_t dataCallback(AAudioStream* stream, void*, void* au
     }
     recordPeak(sCallbackPeak, callbackPeak);
     sCallbackFrames.fetch_add(n, std::memory_order_relaxed);
+    sTotalCallbackFrames.fetch_add(numFrames, std::memory_order_relaxed);
     if (n < (u32)numFrames) {
         memset(out + n * 2, 0, (size_t)(numFrames - n) * 4);
         if (sPlaying && !port_is_paused()) {
@@ -193,9 +197,10 @@ aaudio_data_callback_result_t dataCallback(AAudioStream* stream, void*, void* au
 // The output device went away or changed: port_audio_submit reopens the
 // stream (the callback may not do it itself).
 void errorCallback(AAudioStream*, void*, aaudio_result_t error) {
-    if (error == AAUDIO_ERROR_DISCONNECTED) {
-        sDisconnected = true;
-    }
+    sLastStreamError.store((int)error);
+    // Any stream error (a device switch, the screen recorder taking over the
+    // audio route, a service restart) ends this stream: reopen it.
+    sDisconnected = true;
 }
 
 bool openStream(u32 rate) {
@@ -206,16 +211,23 @@ bool openStream(u32 rate) {
     // The device's own rate (48 kHz on the Quest): asking for the game's
     // 32 kHz moves AAudio off its fast path, to 20 ms bursts.
     (void)rate;
-    AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    // Normal (non-MMAP) shared mode: screen recorders and Android's playback
+    // capture cannot record the low-latency MMAP path, which left recordings
+    // silent or cut the game's sound when recording started.  The game mixes a
+    // whole frame at a time, so the extra ~10-20 ms is not noticeable.
+    AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_NONE);
     AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_GAME);
     AAudioStreamBuilder_setContentType(b, AAUDIO_CONTENT_TYPE_MUSIC);
+#if defined(__ANDROID_API__) && __ANDROID_API__ >= 29
+    AAudioStreamBuilder_setAllowedCapturePolicy(b, AAUDIO_ALLOW_CAPTURE_BY_ALL);
+#endif
     AAudioStreamBuilder_setDataCallback(b, dataCallback, nullptr);
     AAudioStreamBuilder_setErrorCallback(b, errorCallback, nullptr);
     aaudio_result_t r = AAudioStreamBuilder_openStream(b, &sStream);
     AAudioStreamBuilder_delete(b);
     if (r != AAUDIO_OK) {
-        port_log("audio: AAudio LOW_LATENCY open failed (%s), retrying with default mode...", AAudio_convertResultToText(r));
+        port_log("audio: AAudio open (normal shared mode) failed (%s), retrying with default mode...", AAudio_convertResultToText(r));
         if (AAudio_createStreamBuilder(&b) == AAUDIO_OK) {
             AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
             AAudioStreamBuilder_setChannelCount(b, 2);
@@ -242,7 +254,8 @@ bool openStream(u32 rate) {
     int32_t burst = AAudioStream_getFramesPerBurst(sStream);
     if (burst <= 0) burst = 192;
     int32_t cap = AAudioStream_getBufferCapacityInFrames(sStream);
-    int32_t desired = (cap > 0) ? std::min(burst * 3, cap) : burst * 3;
+    int32_t want = std::max(burst * 3, 960);  // at least 20 ms at 48 kHz
+    int32_t desired = (cap > 0) ? std::min(want, cap) : want;
     AAudioStream_setBufferSizeInFrames(sStream, desired);
     sRingRead.store(sRingWrite.load());
     sResampler = Resampler();
@@ -299,6 +312,45 @@ extern "C" void port_audio_submit(const s16* rightLeft, u32 frames, u32 rate) {
         if ((sWavFrames & 0x3FFF) < frames) {
             writeWavHeader(sWav, sWavFrames, rate);
             fflush(sWav);
+        }
+    }
+
+    // Watchdog, once a second: the recorder or another app can pause, stop or
+    // stall the stream without a clean error.  Report it and recover.
+    {
+        static int64_t nextWatchNs = 0;
+        static uint64_t lastCallbackTotal = 0;
+        static int64_t lastProgressNs = 0;
+        const int64_t nowNs = port_host_time_ns();
+        if (const int err = sLastStreamError.exchange(0)) {
+            port_log("audio: stream error %d (%s); the output will be reopened", err, AAudio_convertResultToText(err));
+        }
+        if (sStream && nowNs >= nextWatchNs) {
+            nextWatchNs = nowNs + 1000000000ll;
+            const aaudio_stream_state_t st = AAudioStream_getState(sStream);
+            const uint64_t total = sTotalCallbackFrames.load(std::memory_order_relaxed);
+            if (total != lastCallbackTotal || lastProgressNs == 0) {
+                lastCallbackTotal = total;
+                lastProgressNs = nowNs;
+            }
+            if (!port_is_paused()) {
+                if (st == AAUDIO_STREAM_STATE_PAUSED || st == AAUDIO_STREAM_STATE_STOPPED ||
+                    st == AAUDIO_STREAM_STATE_FLUSHED) {
+                    port_log("audio: stream was %d (not started) while the game runs; starting it again", (int)st);
+                    AAudioStream_requestStart(sStream);
+                } else if (st == AAUDIO_STREAM_STATE_DISCONNECTED || st == AAUDIO_STREAM_STATE_CLOSED ||
+                           st == AAUDIO_STREAM_STATE_UNINITIALIZED) {
+                    port_log("audio: stream state %d; reopening the output", (int)st);
+                    sDisconnected.store(true);
+                } else if (st == AAUDIO_STREAM_STATE_STARTED && nowNs - lastProgressNs > 2500000000ll) {
+                    port_log("audio: the device has not read audio for %.1f s (state started); reopening the output",
+                             (double)(nowNs - lastProgressNs) / 1e9);
+                    sDisconnected.store(true);
+                    lastProgressNs = nowNs;
+                }
+            } else {
+                lastProgressNs = nowNs;
+            }
         }
     }
 

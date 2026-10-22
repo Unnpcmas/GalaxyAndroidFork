@@ -45,6 +45,11 @@ extern "C" int port_input_camera_invert_y(void);
 extern "C" int64_t port_host_time_ns(void);
 extern "C" int port_is_pointer_menu_navigation(void);
 
+// Set from the on-screen "reset camera" button: the manual orbit returns to the
+// game's own camera pose on the next update.
+static volatile int sCameraResetRequested = 0;
+extern "C" void port_camera_reset(void) { sCameraResetRequested = 1; }
+
 static inline TVec3f rotateVectorAxis(const TVec3f& v, const TVec3f& axis, f32 angle) {
     f32 cosA = MR::cos(angle);
     f32 sinA = MR::sin(angle);
@@ -236,6 +241,13 @@ void CameraDirector::calcPose() {
     static f32 sCameraStickX = 0.0f;
     static f32 sCameraStickY = 0.0f;
     static int64_t sLastCameraInputNs = 0;
+    if (sCameraResetRequested) {
+        sCameraResetRequested = 0;
+        sOrbitYaw = 0.0f;
+        sOrbitPitch = 0.0f;
+        sCameraStickX = 0.0f;
+        sCameraStickY = 0.0f;
+    }
 
     // Reset orbit on camera reset button or force camera change
     if (CameraLocalUtil::testCameraPadTriggerReset() ||

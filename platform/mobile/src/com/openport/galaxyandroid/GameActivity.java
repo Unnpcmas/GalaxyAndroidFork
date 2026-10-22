@@ -18,21 +18,27 @@ import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.content.Context;
 import android.content.Intent;
+import android.database.Cursor;
+import android.net.Uri;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.provider.OpenableColumns;
 import android.widget.Toast;
 
 import java.util.ArrayDeque;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 
 public class GameActivity extends NativeActivity {
     private static final String TAG = "GalaxyGameActivity";
+    private static final int REQ_PICK_MOD_ZIP = 3107;
     private static GameActivity sInstance;
     private AudioManager audioManager;
     private AudioFocusRequest audioFocusRequest;
+    private String pendingModsDirectory = "";
     private static final ArrayDeque<String> androidDiagnostics = new ArrayDeque<>();
     private static final int MAX_ANDROID_DIAGNOSTICS = 128;
     private static final Object diagnosticFileLock = new Object();
@@ -146,6 +152,100 @@ public class GameActivity extends NativeActivity {
             if (gamepad || joystick) return true;
         }
         return false;
+    }
+
+    public static void requestModsZipImport(String modsDirectory) {
+        GameActivity activity = sInstance;
+        if (activity == null || modsDirectory == null || modsDirectory.isEmpty()) return;
+        activity.runOnUiThread(() -> activity.openModsZipPicker(modsDirectory));
+    }
+
+    private void openModsZipPicker(String modsDirectory) {
+        if (pendingModsDirectory != null && !pendingModsDirectory.isEmpty()) {
+            Toast.makeText(this, "Ya hay una selección de mod abierta.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        pendingModsDirectory = modsDirectory;
+        try {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("*/*");
+            intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
+                    "application/zip", "application/x-zip-compressed", "application/octet-stream"
+            });
+            startActivityForResult(intent, REQ_PICK_MOD_ZIP);
+        } catch (RuntimeException error) {
+            pendingModsDirectory = "";
+            recordDiagnostic("ERROR", "Could not open the local mod ZIP picker", error);
+            Toast.makeText(this, "No se pudo abrir el selector de archivos.", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_PICK_MOD_ZIP) return;
+
+        String modsDirectory = pendingModsDirectory;
+        pendingModsDirectory = "";
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            Toast.makeText(this, "Importación de mod cancelada.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Uri uri = data.getData();
+        new Thread(() -> importModsZip(uri, modsDirectory), "GalaxyModZipImport").start();
+    }
+
+    private void importModsZip(Uri uri, String modsDirectory) {
+        try (InputStream input = getContentResolver().openInputStream(uri)) {
+            if (input == null) throw new IOException("No se pudo leer el archivo seleccionado.");
+            String archiveName = getDisplayName(uri);
+            ModZipImporter.Result result = ModZipImporter.install(
+                    input, new File(modsDirectory), archiveName);
+            recordDiagnostic("INFO", "Imported local resource mod id=" + result.id +
+                    " resources=" + result.resourceFiles +
+                    " pathCheck=" + (result.compatibilityChecked ? "checked" : "unavailable") +
+                    " matchingBaseFiles=" + result.matchingBaseFiles +
+                    " missingBaseFiles=" + result.missingBaseFiles, null);
+            String pathSummary;
+            if (!result.compatibilityChecked) {
+                pathSummary = "No se pudieron comparar las rutas con la carpeta files/ del juego.";
+            } else if (result.missingBaseFiles == 0) {
+                pathSummary = "Las " + result.matchingBaseFiles +
+                        " rutas existen en la carpeta files/ del juego.";
+            } else {
+                pathSummary = result.matchingBaseFiles + " de " + result.resourceFiles +
+                        " rutas existen en files/; " + result.missingBaseFiles +
+                        " no aparecen ahí.";
+            }
+            String message = "Mod importado: " + result.name + ". " + pathSummary +
+                    " Esto no valida el índice del juego ni el formato del recurso. Pulsa Escanear para activarlo.";
+            runOnUiThread(() -> Toast.makeText(this, message, Toast.LENGTH_LONG).show());
+        } catch (Exception error) {
+            Log.e(TAG, "Local mod ZIP import failed", error);
+            recordDiagnostic("ERROR", "Local mod ZIP import failed", error);
+            String detail = error.getMessage();
+            if (detail == null || detail.isEmpty()) detail = "ZIP inválido o no compatible.";
+            final String message = detail;
+            runOnUiThread(() -> Toast.makeText(this, message, Toast.LENGTH_LONG).show());
+        }
+    }
+
+    private String getDisplayName(Uri uri) {
+        if (uri == null) return "";
+        try (Cursor cursor = getContentResolver().query(uri, null, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (column >= 0) {
+                    String value = cursor.getString(column);
+                    if (value != null && !value.isEmpty()) return value;
+                }
+            }
+        } catch (RuntimeException error) {
+            recordDiagnostic("WARN", "Could not read the selected ZIP display name", error);
+        }
+        String segment = uri.getLastPathSegment();
+        return segment == null ? "mod-local.zip" : segment;
     }
 
     @Override

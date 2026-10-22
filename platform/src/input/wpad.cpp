@@ -19,6 +19,13 @@ static int sReportedConnected[4];
 static int sReportedExtension[4];
 static std::atomic<float> sCameraSensitivity{1.0f};
 static std::atomic<int> sCameraInvertY{0};
+// While set, the game sees a neutral pad (no stick, buttons or pointer motion):
+// the free camera uses the same controls instead.
+static std::atomic<int> sGameInputBlocked{0};
+
+extern "C" void port_input_block_game(int blocked) {
+    sGameInputBlocked.store(blocked ? 1 : 0);
+}
 
 extern "C" void port_input_request_pause(void);
 
@@ -32,6 +39,11 @@ extern "C" void port_input_set(int chan, const PortPadState* state) {
         port_input_request_pause();
     }
     sPad[chan] = *state;
+    if (chan == 0 && sGameInputBlocked.load()) {
+        sPad[chan].buttons = 0;
+        sPad[chan].stickX = sPad[chan].stickY = 0.0f;
+        sPad[chan].rightStickX = sPad[chan].rightStickY = 0.0f;
+    }
 }
 
 extern "C" void port_input_get_right_stick(int chan, float* x, float* y) {

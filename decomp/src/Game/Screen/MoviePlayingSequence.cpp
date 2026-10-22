@@ -303,12 +303,9 @@ void MoviePlayingSequence::exePlayWait() {
 }
 
 void MoviePlayingSequence::exePlayStart() {
-    if (port_is_skip_cutscenes()) {
-        MR::forceCloseWipeFade();
-        setNerve(GET_NERVE(MoviePlayingSequence, HostTypeEndWait));
-        return;
-    }
-
+    // Skip-cutscenes no longer bypasses the player here: the movie is started and
+    // stopped through the normal lifecycle (trySkip, first step of exePlay), because
+    // leaving this nerve without ever starting the player crashed some movies.
     if (MR::isFirstStep(this)) {
         MR::startMoviePlayer(::getMovieName(mInfo));
         MR::tryFrameToScreenCinemaFrame();

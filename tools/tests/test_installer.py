@@ -245,7 +245,7 @@ class InstallerTests(unittest.TestCase):
     def test_packager_refuses_a_debuggable_release(self):
         # The attribute is read as XML, so the manifest's own comment about
         # android:debuggable="true" does not count as setting it.
-        self.assertTrue(package_mobile_apk.manifest_is_debuggable())
+        self.assertFalse(package_mobile_apk.manifest_is_debuggable())
         with tempfile.TemporaryDirectory() as tmp:
             clean = Path(tmp) / 'AndroidManifest.xml'
             clean.write_text(
@@ -255,12 +255,20 @@ class InstallerTests(unittest.TestCase):
                 '  <application android:debuggable="false" />\n'
                 '</manifest>\n', encoding='utf-8')
             self.assertFalse(package_mobile_apk.manifest_is_debuggable(clean))
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop('GALAXY_ALLOW_DEBUGGABLE', None)
-            with self.assertRaisesRegex(SystemExit, 'REFUSING TO PACKAGE'):
-                package_mobile_apk.require_deliberate_debuggable()
-        with mock.patch.dict(os.environ, {'GALAXY_ALLOW_DEBUGGABLE': '1'}):
-            package_mobile_apk.require_deliberate_debuggable()
+            debug = Path(tmp) / 'AndroidManifest-debuggable.xml'
+            debug.write_text(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                '  <application android:debuggable="true" />\n'
+                '</manifest>\n', encoding='utf-8')
+            self.assertTrue(package_mobile_apk.manifest_is_debuggable(debug))
+            with mock.patch.object(package_mobile_apk, 'manifest_is_debuggable', return_value=True):
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop('GALAXY_ALLOW_DEBUGGABLE', None)
+                    with self.assertRaisesRegex(SystemExit, 'REFUSING TO PACKAGE'):
+                        package_mobile_apk.require_deliberate_debuggable()
+                with mock.patch.dict(os.environ, {'GALAXY_ALLOW_DEBUGGABLE': '1'}):
+                    package_mobile_apk.require_deliberate_debuggable()
 
     def test_platform_tools_download_stays_pinned(self):
         for name, (archive, size, sha256) in build_installer.PLATFORM_TOOLS.items():

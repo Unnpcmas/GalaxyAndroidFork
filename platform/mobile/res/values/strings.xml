@@ -4,6 +4,8 @@
     <string name="header_title">Galaxy Android</string>
     <string name="header_subtitle">Port Android independiente · ARM64</string>
     <string name="section_source">Archivos del juego</string>
+    <string name="btn_browse_game_files">Explorar carpeta instalada</string>
+    <string name="hint_browse_game_files">Buscar, ver y copiar rutas o archivos de GalaxyData.</string>
     <string name="btn_select_disc">Seleccionar archivo de juego</string>
     <string name="btn_auto_detect">Buscar en Descargas</string>
     <string name="no_source_selected">Ningún archivo seleccionado</string>

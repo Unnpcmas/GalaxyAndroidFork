@@ -4,6 +4,20 @@
 #include <string.h>
 #include <time.h>
 
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+#include <exception>
+#include <stdlib.h>
+#include <typeinfo>
+#include <fcntl.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <unistd.h>
+#include <unwind.h>
+#endif
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -285,6 +299,7 @@ extern "C" int port_log_to_stderr = 0;
 // few minutes of a busy headset, too little to look into a session after it.
 static std::mutex sLogFileLock;
 static FILE* sLogFile = nullptr;
+
 static long sLogFileBytes = 0;
 // The in-memory diagnostics ring holds 5,000 complete entries. A 4 MiB
 // session file keeps at least that much history while bounding local storage.
@@ -307,6 +322,287 @@ static void appendLogRingLineUnlocked(const char* line) {
     }
     snprintf(sLogRing[slot], kMaxLogLineLen, "%s", line ? line : "");
 }
+
+
+#if defined(__ANDROID__)
+// ---------------------------------------------------------------------------
+// Crash report.  A fatal signal (or an uncaught C++ exception) writes a detailed
+// report to galaxy_log.txt AND to crash_report.txt next to it before the process
+// dies: the reason in plain words, thread, registers, memory use, the native
+// backtrace (module + offset) and the last log lines (what the game was doing).
+// The next start copies the report into the new log under
+// "----- previous crash report -----", so one exported log tells the whole story.
+// ---------------------------------------------------------------------------
+namespace {
+char sCrashReportPath[512] = {};
+char sTerminateMsg[256] = {};
+std::atomic<int> sInCrash{0};
+
+struct CrashOut { char* buf; int len; int cap; };
+void cprintf(CrashOut* o, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+void cprintf(CrashOut* o, const char* fmt, ...) {
+    if (o->len >= o->cap - 1) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(o->buf + o->len, (size_t)(o->cap - o->len), fmt, ap);
+    va_end(ap);
+    if (w > 0) o->len = (o->len + w < o->cap) ? o->len + w : o->cap - 1;
+}
+
+struct CrashBt { CrashOut* out; int n; };
+_Unwind_Reason_Code crashBtStep(struct _Unwind_Context* ctx, void* arg) {
+    CrashBt* bt = (CrashBt*)arg;
+    uintptr_t pc = _Unwind_GetIP(ctx);
+    if (!pc || bt->n >= 28) return _URC_END_OF_STACK;
+    Dl_info info;
+    if (dladdr((void*)pc, &info) && info.dli_fname) {
+        const char* base = strrchr(info.dli_fname, '/');
+        base = base ? base + 1 : info.dli_fname;
+        cprintf(bt->out, "  #%02d %s+0x%lx %s\n", bt->n, base, (unsigned long)(pc - (uintptr_t)info.dli_fbase),
+                info.dli_sname ? info.dli_sname : "");
+    } else {
+        cprintf(bt->out, "  #%02d pc=0x%lx (unknown module)\n", bt->n, (unsigned long)pc);
+    }
+    bt->n++;
+    return _URC_NO_REASON;
+}
+
+const char* signalName(int sig) {
+    switch (sig) {
+    case SIGSEGV: return "SIGSEGV (segmentation fault)";
+    case SIGBUS: return "SIGBUS (bus error)";
+    case SIGABRT: return "SIGABRT (abort)";
+    case SIGFPE: return "SIGFPE (arithmetic error)";
+    case SIGILL: return "SIGILL (illegal instruction)";
+    default: return "signal";
+    }
+}
+
+void crashReason(CrashOut* o, int sig, siginfo_t* info) {
+    const unsigned long addr = info ? (unsigned long)info->si_addr : 0;
+    const int code = info ? info->si_code : 0;
+    switch (sig) {
+    case SIGSEGV:
+        if (code == SEGV_MAPERR) {
+            if (addr < 0x10000) {
+                cprintf(o, "REASON: null pointer dereference (read/write at offset 0x%lx of a null object)\n", addr);
+            } else {
+                cprintf(o, "REASON: access to unmapped memory at 0x%lx (dangling/freed pointer, buffer overrun or "
+                           "stale handle)\n", addr);
+            }
+        } else if (code == SEGV_ACCERR) {
+            cprintf(o, "REASON: forbidden access at 0x%lx (write to read-only memory or execute of data)\n", addr);
+        } else {
+            cprintf(o, "REASON: invalid memory access at 0x%lx (si_code %d)\n", addr, code);
+        }
+        break;
+    case SIGBUS:
+        cprintf(o, "REASON: bus error at 0x%lx (%s)\n", addr,
+                code == BUS_ADRALN ? "misaligned access" : code == BUS_ADRERR ? "address does not exist (file/mmap)"
+                                                                               : "hardware memory fault");
+        break;
+    case SIGABRT:
+        if (sTerminateMsg[0]) {
+            cprintf(o, "REASON: %s\n", sTerminateMsg);
+        } else {
+            cprintf(o, "REASON: abort() called: failed assertion, heap corruption detected by the allocator "
+                       "(double free / overflow) or a deliberate abort\n");
+        }
+        break;
+    case SIGFPE:
+        cprintf(o, "REASON: arithmetic error (%s)\n", code == FPE_INTDIV ? "integer divide by zero" : "floating point");
+        break;
+    case SIGILL:
+        cprintf(o, "REASON: illegal instruction (corrupt code, jump through a bad function pointer)\n");
+        break;
+    default:
+        cprintf(o, "REASON: fatal signal %d\n", sig);
+    }
+}
+
+void crashMemory(CrashOut* o) {
+    int fd = open("/proc/self/status", O_RDONLY);
+    if (fd < 0) return;
+    char tmp[2048];
+    ssize_t n = read(fd, tmp, sizeof(tmp) - 1);
+    close(fd);
+    if (n <= 0) return;
+    tmp[n] = '\0';
+    const char* keys[] = {"VmSize:", "VmRSS:", "VmSwap:", "Threads:"};
+    for (const char* key : keys) {
+        const char* p = strstr(tmp, key);
+        if (!p) continue;
+        const char* e = strchr(p, '\n');
+        cprintf(o, "  %.*s\n", e ? (int)(e - p) : 40, p);
+    }
+}
+
+// A thread can arm a recovery point around code that may fault on bad guest data
+// (the software audio mixer): a SIGSEGV/SIGBUS there jumps back instead of
+// killing the game.  Counters tell the caller what happened.
+// What the game was doing, kept current by the main loop and the scene code so a
+// crash report can say it without asking anything of a possibly broken heap.
+char sCrashScene[96] = "(no scene yet)";
+char sCrashContext[1000] = "(no context yet)";
+__thread sigjmp_buf* sCrashGuard = nullptr;
+std::atomic<unsigned> sGuardFaults{0};
+std::atomic<unsigned long> sGuardLastOffset{0};
+std::atomic<unsigned long> sGuardLastAddr{0};
+
+void crashHandler(int sig, siginfo_t* info, void* uctx) {
+    if ((sig == SIGSEGV || sig == SIGBUS) && sCrashGuard) {
+        unsigned long pcOff = 0;
+#if defined(__aarch64__)
+        if (uctx) {
+            Dl_info di;
+            const uintptr_t pc = (uintptr_t)((ucontext_t*)uctx)->uc_mcontext.pc;
+            pcOff = dladdr((void*)pc, &di) ? (unsigned long)(pc - (uintptr_t)di.dli_fbase) : (unsigned long)pc;
+        }
+#endif
+        sGuardLastOffset.store(pcOff);
+        sGuardLastAddr.store(info ? (unsigned long)info->si_addr : 0);
+        sGuardFaults.fetch_add(1);
+        sigjmp_buf* g = sCrashGuard;
+        sCrashGuard = nullptr;
+        siglongjmp(*g, 1);
+    }
+    if (sInCrash.exchange(1) == 0) {
+        static char buf[12288];
+        CrashOut o{buf, 0, (int)sizeof(buf)};
+        char thread[24] = {};
+        prctl(PR_GET_NAME, (unsigned long)thread, 0, 0, 0);
+        struct timespec up;
+        clock_gettime(CLOCK_MONOTONIC, &up);
+        cprintf(&o, "CRASH ==============================================\n");
+        cprintf(&o, "CRASH: %s, si_code %d, thread \"%s\" (tid %ld), uptime %lds\n", signalName(sig),
+                info ? info->si_code : 0, thread, (long)syscall(SYS_gettid), (long)up.tv_sec);
+        crashReason(&o, sig, info);
+#if defined(__aarch64__)
+        if (uctx) {
+            const mcontext_t& m = ((ucontext_t*)uctx)->uc_mcontext;
+            cprintf(&o, "REGS: pc=0x%llx lr=0x%llx sp=0x%llx fault=0x%llx\n", (unsigned long long)m.pc,
+                    (unsigned long long)m.regs[30], (unsigned long long)m.sp, (unsigned long long)m.fault_address);
+            cprintf(&o, "REGS: x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx x19=0x%llx x20=0x%llx\n",
+                    (unsigned long long)m.regs[0], (unsigned long long)m.regs[1], (unsigned long long)m.regs[2],
+                    (unsigned long long)m.regs[3], (unsigned long long)m.regs[19], (unsigned long long)m.regs[20]);
+        }
+#else
+        (void)uctx;
+#endif
+        cprintf(&o, "SCENE: %.95s\n", sCrashScene);
+        cprintf(&o, "CONTEXT: %.999s\n", sCrashContext);
+        cprintf(&o, "MEMORY:\n");
+        crashMemory(&o);
+        cprintf(&o, "BACKTRACE (module+offset; resolve offsets with addr2line against the same build):\n");
+        CrashBt bt{&o, 0};
+        _Unwind_Backtrace(crashBtStep, &bt);
+        // What the game was doing: the newest log lines (read without locking).
+        cprintf(&o, "LAST LOG LINES (newest last):\n");
+        const int keep = 28;
+        const int total = sLogRingCount;
+        for (int i = total > keep ? total - keep : 0; i < total; i++) {
+            const char* line = sLogRing[(sLogRingStart + i) % kMaxLogRing];
+            if (strstr(line, "  draw #") || strstr(line, "  marker:")) continue;  // render dump noise
+            cprintf(&o, "  %.200s\n", line);
+        }
+        cprintf(&o, "CRASH END ============================================\n");
+        if (sLogFile) {
+            fflush(sLogFile);
+            ssize_t ignored = write(fileno(sLogFile), buf, (size_t)o.len);
+            (void)ignored;
+            fsync(fileno(sLogFile));
+        }
+        if (sCrashReportPath[0]) {
+            int fd = open(sCrashReportPath, O_WRONLY | O_CREAT | O_TRUNC, 0660);
+            if (fd >= 0) {
+                ssize_t ignored = write(fd, buf, (size_t)o.len);
+                (void)ignored;
+                fsync(fd);
+                close(fd);
+            }
+        }
+    }
+    signal(sig, SIG_DFL);  // let Android produce its usual tombstone / terminate
+    raise(sig);
+}
+
+void terminateHandler() {
+    try {
+        std::exception_ptr e = std::current_exception();
+        if (e) std::rethrow_exception(e);
+        snprintf(sTerminateMsg, sizeof(sTerminateMsg), "std::terminate() called with no active exception");
+    } catch (const std::exception& ex) {
+        snprintf(sTerminateMsg, sizeof(sTerminateMsg), "uncaught C++ exception: %s (%s)", ex.what(), typeid(ex).name());
+    } catch (...) {
+        snprintf(sTerminateMsg, sizeof(sTerminateMsg), "uncaught C++ exception of unknown type");
+    }
+    abort();
+}
+
+void installCrashHandler(const char* logPath) {
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    snprintf(sCrashReportPath, sizeof(sCrashReportPath), "%s", logPath);
+    char* slash = strrchr(sCrashReportPath, '/');
+    snprintf(slash ? slash + 1 : sCrashReportPath, sizeof(sCrashReportPath) - (slash ? (size_t)(slash + 1 - sCrashReportPath) : 0),
+             "crash_report.txt");
+    std::set_terminate(terminateHandler);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crashHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGFPE, &sa, nullptr);
+    sigaction(SIGILL, &sa, nullptr);
+}
+
+// Copies a crash report left by the previous run into the log ring; true if one existed.
+bool importPreviousCrashReport(const char* logPath) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s", logPath);
+    char* slash = strrchr(path, '/');
+    snprintf(slash ? slash + 1 : path, sizeof(path) - (slash ? (size_t)(slash + 1 - path) : 0), "crash_report.txt");
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    {
+        std::lock_guard<std::mutex> ringLock(sLogRingLock);
+        appendLogRingLineUnlocked("----- previous crash report -----");
+        char line[kMaxLogLineLen];
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (line[0]) appendLogRingLineUnlocked(line);
+        }
+    }
+    fclose(f);
+    remove(path);
+    return true;
+}
+}  // namespace
+
+extern "C" void port_crash_set_scene(const char* scene, const char* stage) {
+    snprintf(sCrashScene, sizeof(sCrashScene), "%s / %s", scene ? scene : "?", stage ? stage : "?");
+}
+extern "C" const char* port_crash_scene(void) { return sCrashScene; }
+extern "C" void port_crash_set_context(const char* text) {
+    if (!text) return;
+    snprintf(sCrashContext, sizeof(sCrashContext), "%s", text);
+}
+extern "C" void port_crash_guard_set(void* jb) { sCrashGuard = (sigjmp_buf*)jb; }
+extern "C" unsigned port_crash_guard_faults(void) { return sGuardFaults.load(); }
+extern "C" unsigned long port_crash_guard_last_offset(void) { return sGuardLastOffset.load(); }
+extern "C" unsigned long port_crash_guard_last_addr(void) { return sGuardLastAddr.load(); }
+#else
+extern "C" void port_crash_set_scene(const char*, const char*) {}
+extern "C" void port_crash_set_context(const char*) {}
+extern "C" const char* port_crash_scene(void) { return "(n/a)"; }
+extern "C" void port_crash_guard_set(void*) {}
+extern "C" unsigned port_crash_guard_faults(void) { return 0; }
+extern "C" unsigned long port_crash_guard_last_offset(void) { return 0; }
+extern "C" unsigned long port_crash_guard_last_addr(void) { return 0; }
+#endif
 
 extern "C" void port_log_file(const char* path) {
     // The previous session's log is kept beside it as <path>.prev.
@@ -344,6 +640,11 @@ extern "C" void port_log_file(const char* path) {
             fclose(previous);
         }
     }
+#if defined(__ANDROID__)
+    const bool previousCrashed = importPreviousCrashReport(path);
+#else
+    const bool previousCrashed = false;
+#endif
     {
         std::lock_guard<std::mutex> lock(sLogFileLock);
         sLogFile = fopen(path, "w");
@@ -351,8 +652,13 @@ extern "C" void port_log_file(const char* path) {
         if (sLogFile) {
             setvbuf(sLogFile, nullptr, _IOLBF, 1024);  // each line reaches the file at once, crash or not
         }
+#if defined(__ANDROID__)
+        if (sLogFile) installCrashHandler(path);
+#endif
     }
-    if (hadPreviousSession && !previousSessionClean) {
+    if (previousCrashed) {
+        port_log("ERROR previous run CRASHED: the full crash report is above, under \"previous crash report\"");
+    } else if (hadPreviousSession && !previousSessionClean) {
         // Emit only after releasing sLogFileLock: port_log() takes that same
         // lock when it appends the warning to the new session file.
         port_log("WARN previous process log has no APP_CMD_DESTROY marker; it may have crashed, been force-stopped, or ended by Android (not proof of a crash)");
@@ -406,7 +712,23 @@ static void logToFile(const char* fmt, va_list args) {
     sLogFileBytes += n > 0 ? n + 1 : 1;
 }
 
+static std::atomic<int> sLogEnabled{1};
+
+extern "C" void port_log_set_enabled(int enabled) {
+    sLogEnabled.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+extern "C" int port_log_is_enabled(void) {
+    return sLogEnabled.load(std::memory_order_relaxed);
+}
+
 extern "C" void port_vlog(const char* fmt, va_list args) {
+    // With the log turned off in settings only ERROR/FATAL lines are kept,
+    // so a crash still has something to report.
+    if (!sLogEnabled.load(std::memory_order_relaxed) &&
+        strncmp(fmt, "ERROR", 5) != 0 && strncmp(fmt, "FATAL", 5) != 0) {
+        return;
+    }
     {
         va_list copy;
         va_copy(copy, args);

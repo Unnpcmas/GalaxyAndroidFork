@@ -498,6 +498,7 @@ void fxBeforeFrame() {
     for (int line = 0; line < 4; line++) {
         JASDsp::FxBuf& f = M.fx[line];
         if (!f._0 || !f._4 || !f._2) continue;
+        if (!port_is_game_memory_range(f._4, (size_t)f._2 * N * 2)) continue;
         s16* ring = f._4 + (size_t)(M.fxIndex[line] % f._2) * N;
         s16 buf[8 + N];
         memcpy(buf, M.fxLast8[line], 16);
@@ -530,6 +531,7 @@ void fxAfterFrame() {
     for (int line = 0; line < 4; line++) {
         JASDsp::FxBuf& f = M.fx[line];
         if (!f._0 || !f._4 || !f._2) continue;
+        if (!port_is_game_memory_range(f._4, (size_t)f._2 * N * 2)) continue;
         memcpy(f._4 + (size_t)(M.fxIndex[line] % f._2) * N, fxAccumulator(line), N * 2);
         M.fxIndex[line] = (u16)((M.fxIndex[line] + 1) % f._2);
     }
